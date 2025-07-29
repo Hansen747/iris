@@ -160,6 +160,7 @@ class SAPipeline:
         self.project_fixed_modules = self.project_fixed_methods[
             self.project_fixed_methods["file"].str.contains("src/main") &
             self.project_fixed_methods["file"].str.endswith(".java")]
+        #lambda函数的作用是从每一行的方法文件路径中提取出模块名称。
         self.fixed_modules = self.project_fixed_modules \
             .apply(lambda f: \
                 pd.Series([
@@ -212,8 +213,8 @@ class SAPipeline:
         self.query_output_path = f"{self.project_output_path}/{self.query}"
         os.makedirs(self.query_output_path, exist_ok=True)
         self.query_output_result_sarif_path = f"{self.query_output_path}/results.sarif"
-        self.query_output_result_sarif_pp_path = f"{self.query_output_path}/results_pp.sarif"
         self.query_output_result_csv_path = f"{self.query_output_path}/results.csv"
+        self.query_output_result_sarif_pp_path = f"{self.query_output_path}/results_pp.sarif"
 
         # Setup posthoc-filtering output path
         self.posthoc_filtering_output_path = f"{self.project_output_path}/{self.query}-posthoc-filter"
@@ -333,18 +334,110 @@ class SAPipeline:
             # 3. Filter the APIs by internal/external, and source/sink/taint-prop
             external_api_candidates = self.keep_external_packages(external_api_candidates)
             possible_src_snk_tp = external_api_candidates.apply(lambda row: self.api_is_candidate(row, num_external_apis), axis=1)
+            #self.api_is_candidate 方法会根据某些条件判断该行代表的API是否是候选API。这些条件包括：
+            # 是否在黑名单中（通过 self.api_candidate_not_on_blacklist 方法判断）。
+            # 是否属于固定的模块（通过 self.api_candidate_is_in_fixed_module 方法判断）。
+            # 是否具有非平凡的返回类型（通过 self.api_candidate_has_non_trivial_return 方法判断）。
+            # 是否具有非平凡的参数类型（通过 self.api_candidate_has_non_trivial_parameter 方法判断）。
             external_api_candidates = external_api_candidates[possible_src_snk_tp]
 
             # 4. Keep only the core columns (package, class, function, signature) and deduplicate
             external_api_candidates = external_api_candidates[["package", "clazz", "func", "full_signature"]].drop_duplicates()
             num_candidates = len(external_api_candidates)
 
-            # 5. Dump the filtered API candidates
+            # 5. Add analysis column using GPT
+            self.project_logger.info("  ==> Analyzing APIs with GPT...")
+            external_api_candidates = self.add_api_analysis_with_gpt(external_api_candidates)
+
+            # 6. Dump the filtered API candidates
             self.project_logger.info(f"  ==> #Relevant API Calls: {num_external_apis}, #Filtered Candidates: {num_candidates}")
             self.project_logger.info("  ==> Dumping filtered API candidates...")
             external_api_candidates.to_csv(self.candidate_apis_csv_path, index=False, header=True, sep=',', encoding='utf-8')
         else:
             self.project_logger.info("  ==> Existing candidate APIs file found. Skipping filtering candidates...")
+
+    def add_api_analysis_with_gpt(self, api_candidates_df):
+        """
+        Add analysis column to API candidates using GPT
+        """
+        # Create analysis column
+        api_candidates_df['analysis'] = ''
+        
+        # Prepare API information for GPT analysis
+        api_list = []
+        for _, row in api_candidates_df.iterrows():
+            api_info = f"Package: {row['package']}, Class: {row['clazz']}, Method: {row['func']}, Signature: {row['full_signature']}"
+            api_list.append(api_info)
+        
+        # Create prompt for GPT analysis
+        system_prompt = """You are an expert security analyst. Analyze each API and provide a brief analysis of its potential security implications, usage patterns, and any relevant security considerations. Keep your analysis concise but informative."""
+        
+        user_prompt = f"""Please analyze the following APIs and provide a brief security analysis for each:
+
+{chr(10).join(api_list)}
+
+For each API, provide a brief analysis covering:
+1. What this API typically does
+2. Potential security implications
+3. Common usage patterns
+4. Any security considerations
+
+Format your response as a JSON array with objects containing 'api_index' (0-based) and 'analysis' fields."""
+
+        try:
+            # Get GPT model
+            model = self.get_model()
+            
+            # Query GPT
+            response = model.predict([{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}])
+            
+            # Parse response
+            analysis_results = self.parse_api_analysis_json(response)
+            
+            # Add analysis to dataframe
+            for result in analysis_results:
+                if 'api_index' in result and 'analysis' in result:
+                    idx = result['api_index']
+                    if idx < len(api_candidates_df):
+                        api_candidates_df.iloc[idx, api_candidates_df.columns.get_loc('analysis')] = result['analysis']
+            
+            self.project_logger.info(f"  ==> Successfully analyzed {len(analysis_results)} APIs with GPT")
+            
+        except Exception as e:
+            self.project_logger.error(f"  ==> Error analyzing APIs with GPT: {e}")
+            # Fill with placeholder if GPT analysis fails
+            api_candidates_df['analysis'] = 'Analysis failed'
+        
+        return api_candidates_df
+
+    def parse_api_analysis_json(self, json_str):
+        """
+        Parse the JSON response from GPT API analysis
+        """
+        try:
+            # Clean up the response
+            import re
+            json_str = json_str.replace("\\n", "").replace("\\\n", "")
+            json_str = re.sub("//.*", "", json_str)
+            json_str = re.sub("\"\"", "\"", json_str)
+            
+            # Try to extract JSON array
+            json_match = re.findall(r"\[[\s\S]*\]", json_str)
+            if json_match:
+                result = json.loads(json_match[0])
+                if isinstance(result, list):
+                    return result
+            
+            # Fallback: try to parse individual objects
+            results = re.findall(r"{[^}]*}", json_str)
+            if results:
+                return [json.loads(r.strip()) for r in results]
+                
+        except Exception as e:
+            self.project_logger.error(f"Error parsing API analysis JSON: {e}")
+            self.project_logger.error(f"Raw response: {json_str}")
+        
+        return []
 
     def func_parameter_has_non_trivial_parameter(self, row):
         param_types_raw = "" if type(row["parameter_types"]) == float else row["parameter_types"]
@@ -750,7 +843,7 @@ class SAPipeline:
     def build_source_qll_with_enumeration(self):
         source_apis = self.filter_invalid_entries(json.load(open(self.llm_labelled_source_apis_path)))
         source_api_entries = [
-            QL_METHOD_CALL_SOURCE_BODY_ENTRY.format(
+            QL_METHOD_CALL_SOURCE_BODY_ENTRY.format( #查询所有调用了该method的地方
                 method=api["method"],
                 package=api["package"],
                 clazz=api["class"],
@@ -758,7 +851,7 @@ class SAPipeline:
         ]
         source_params = self.filter_invalid_entries(json.load(open(self.llm_labelled_source_func_params_path)))
         source_params_entries = [
-            QL_FUNC_PARAM_SOURCE_ENTRY.format(
+            QL_FUNC_PARAM_SOURCE_ENTRY.format( #查询在指定方法中的所有参数
                 method=param_func["method"],
                 package=param_func["package"],
                 clazz=param_func["class"],
@@ -776,7 +869,7 @@ class SAPipeline:
         if len(all_entries) == 0:
             all_entries = ["1 = 0"]
 
-        batch_size = 300
+        batch_size = 300 #source 每一批执行的ql查询条目
         if len(all_entries) > batch_size:
             num_batches = int(math.ceil(len(all_entries) / batch_size))
             body = " or\n".join([
@@ -794,7 +887,7 @@ class SAPipeline:
             body = QL_BODY_OR_SEPARATOR.join(all_entries)
             additional = ""
 
-        my_source_content = QL_SOURCE_PREDICATE.format(body=body, additional=additional)
+        my_source_content = QL_SOURCE_PREDICATE.format(body=body, additional=additional)#检测节点是不是被LLM标记的source节点
         return my_source_content
 
     def build_and_save_source_qll_with_enumeration(self):
@@ -1226,31 +1319,49 @@ class SAPipeline:
 
         # 1. Collect all the invoked external APIs
         self.collect_invoked_external_apis()
+        # self.cwe_output_path/candidate_apis.csv
 
         # 2. Collect all the internal function parameters
         self.collect_internal_function_parameters()
+        # self.common_output_path/source_func_param_candidates.csv
 
         # 3. Query GPT for source/taint-propagator/sink from external APIs
         self.query_gpt_for_api_src_tp_sink_batched()
+        #self.llm_labelled_sink_apis_path = f"{self.cwe_output_path}/llm_labelled_sink_apis.json"
+        #self.llm_labelled_source_apis_path = f"{self.cwe_output_path}/llm_labelled_source_apis.json"
+        #self.llm_labelled_taint_prop_apis_path = f"{self.cwe_output_path}/llm_labelled_taint_prop_apis.json"
 
         # 4. Query GPT for sources among internal function parameters
         self.query_gpt_for_func_param_src()
+        # self.llm_labelled_source_func_params_path = f"{self.common_output_path}/llm_labelled_source_func_params.json"
 
         # 5. Build local query for this project
         self.build_project_specific_query()
+        # # CodeQL queries temporary path
+        # self.source_qll_path = f"{self.cwe_output_path}/MySources.qll"
+        # self.summary_qll_path = f"{self.cwe_output_path}/MySummaries.qll"
+        # self.sink_qll_path = f"{self.cwe_output_path}/MySinks.qll"
+        # self.spec_yml_path = f"{self.cwe_output_path}/Spec.yml"
 
         # 6. Send the local query for vulnerability detection
         self.find_vulnerability()
-
+        # self.query_output_result_sarif_path = f"{self.query_output_path}/results.sarif"
+        # self.query_output_result_csv_path = f"{self.query_output_path}/results.csv"
         # 7. Do a post-processing step for rule-based filtering of paths
         self.post_process_cwe_query_result()
+        # 对CodeQL检测出的漏洞结果进行"后处理"，
+        # 过滤掉无效、无意义或误报的路径和告警，
+        # 以提升最终输出结果的准确性和可用性
 
         # 8. Do posthoc filtering
         self.query_gpt_for_posthoc_filtering()
+        # self.posthoc_filtering_output_result_sarif_path = f"{self.posthoc_filtering_output_path}/results.sarif"
+        # self.posthoc_filtering_output_result_json_path = f"{self.posthoc_filtering_output_path}/results.json"
+        # self.posthoc_filtering_output_stats_json_path = f"{self.posthoc_filtering_output_path}/stats.json"
 
         # 9. Evaluate performance
         self.evaluate_result()
-
+        # self.final_output_json_path = f"{self.final_output_path}/results.json"
         # 10. Debuggging
         self.debug_result()
 

@@ -27,7 +27,7 @@ Among the following methods, \
 assuming that the arguments passed to the given function is malicious, \
 what are the functions that are potential source, sink, or taint-propagators to {cwe_description} attack (CWE-{cwe_id})?
 
-Package,Class,Method,Signature
+Package,Class,Method,Signature,Analysis
 {methods}
 """
 
