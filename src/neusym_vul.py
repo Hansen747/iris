@@ -1,4 +1,5 @@
 import os
+import csv
 import sys
 import subprocess as sp
 import pandas as pd
@@ -10,7 +11,7 @@ import numpy as np
 import copy
 import math
 import random
-
+from openai import OpenAI  # 假设使用OpenAI兼容的API
 import requests
 from tqdm import tqdm
 from tqdm.contrib.concurrent import thread_map
@@ -24,6 +25,8 @@ from src.config import CODEQL_DIR, CODEQL_DB_PATH, PACKAGE_MODULES_PATH, OUTPUT_
 
 from src.logger import Logger
 from src.queries import QUERIES
+from src.prompts import API_ANALYSIS_SYSTEM_PROMPT, API_ANALYSIS_USER_PROMPT
+from src.prompts import METHOD_ANALYSIS_USER_PROMPT,METHOD_ANALYSIS_SYSTEM_PROMPT
 from src.prompts import API_LABELLING_SYSTEM_PROMPT, API_LABELLING_USER_PROMPT
 from src.prompts import FUNC_PARAM_LABELLING_SYSTEM_PROMPT, FUNC_PARAM_LABELLING_USER_PROMPT
 
@@ -188,6 +191,7 @@ class SAPipeline:
         # Path towards candidate APIs CSV files
         self.external_apis_csv_path = f"{self.cwe_output_path}/external_apis.csv"
         self.candidate_apis_csv_path = f"{self.cwe_output_path}/candidate_apis.csv"
+        self.analysed_apis_csv_path = f"{self.cwe_output_path}/analysed_apis.csv"#被分析的外部api
         self.llm_labelled_sink_apis_path = f"{self.cwe_output_path}/llm_labelled_sink_apis.json"
         self.llm_labelled_source_apis_path = f"{self.cwe_output_path}/llm_labelled_source_apis.json"
         self.llm_labelled_taint_prop_apis_path = f"{self.cwe_output_path}/llm_labelled_taint_prop_apis.json"
@@ -195,6 +199,7 @@ class SAPipeline:
         # Path towards candidate func params CSV files
         self.func_param_path = f"{self.common_output_path}/func_params.csv"
         self.source_func_param_candidates_path = f"{self.common_output_path}/source_func_param_candidates.csv"
+        self.analysed_func_params_path = f"{self.common_output_path}/analysed_func_params.csv"#被分析的内部方法
         self.llm_labelled_source_func_params_path = f"{self.common_output_path}/llm_labelled_source_func_params.json"
 
         # LLM related log paths
@@ -345,99 +350,90 @@ class SAPipeline:
             external_api_candidates = external_api_candidates[["package", "clazz", "func", "full_signature"]].drop_duplicates()
             num_candidates = len(external_api_candidates)
 
-            # 5. Add analysis column using GPT
-            self.project_logger.info("  ==> Analyzing APIs with GPT...")
-            external_api_candidates = self.add_api_analysis_with_gpt(external_api_candidates)
-
-            # 6. Dump the filtered API candidates
+            # 5. Dump the filtered API candidates
             self.project_logger.info(f"  ==> #Relevant API Calls: {num_external_apis}, #Filtered Candidates: {num_candidates}")
             self.project_logger.info("  ==> Dumping filtered API candidates...")
             external_api_candidates.to_csv(self.candidate_apis_csv_path, index=False, header=True, sep=',', encoding='utf-8')
         else:
             self.project_logger.info("  ==> Existing candidate APIs file found. Skipping filtering candidates...")
 
-    def add_api_analysis_with_gpt(self, api_candidates_df):
-        """
-        Add analysis column to API candidates using GPT
-        """
-        # Create analysis column
-        api_candidates_df['analysis'] = ''
-        
-        # Prepare API information for GPT analysis
-        api_list = []
-        for _, row in api_candidates_df.iterrows():
-            api_info = f"Package: {row['package']}, Class: {row['clazz']}, Method: {row['func']}, Signature: {row['full_signature']}"
-            api_list.append(api_info)
-        
-        # Create prompt for GPT analysis
-        system_prompt = """You are an expert security analyst. Analyze each API and provide a brief analysis of its potential security implications, usage patterns, and any relevant security considerations. Keep your analysis concise but informative."""
-        
-        user_prompt = f"""Please analyze the following APIs and provide a brief security analysis for each:
+    def analyze_apis(self):
+        # 配置LLM客户端 - 根据实际使用的API进行调整
+        client = OpenAI(
+            api_key="sk-T1Vt6PLIOoBll7c2CkCsNOqtqB6rsdLcdcfrUyiXcOZOYDAD",
+            base_url="https://api.chatanywhere.tech/v1"
+        )
+        # 读取CSV并收集API
+        api_entries = []
+        with open(self.candidate_apis_csv_path, mode='r', newline='', encoding='utf-8') as infile:
+            reader = csv.DictReader(infile)
+            fieldnames = reader.fieldnames + ['analysis']
 
-{chr(10).join(api_list)}
+            for row in reader:
+                api_entries.append({
+                    'original_row': row,
+                    'full_signature': row['full_signature']  # 用于日志核对
+                })
+        # 生成API列表（带序号，方便LLM对应）
+        api_list = "\n".join([
+            f"{i + 1}. {e['original_row']['package']}.{e['original_row']['clazz']}.{e['original_row']['func']}: {e['full_signature']}"
+            for i, e in enumerate(api_entries)
+        ])
+        cwe_long_description = QUERIES[self.query]["prompts"]["long_desc"]
+        cwe_examples = json.dumps(QUERIES[self.query]["prompts"]["examples"], indent=2)#cwe_examples可能需要重写
+        # 构建提示
+        user_prompt = API_ANALYSIS_USER_PROMPT.format(
+            cwe_long_description=cwe_long_description,
+            cwe_examples=cwe_examples,
+            api_list=api_list
+        )
 
-For each API, provide a brief analysis covering:
-1. What this API typically does
-2. Potential security implications
-3. Common usage patterns
-4. Any security considerations
-
-Format your response as a JSON array with objects containing 'api_index' (0-based) and 'analysis' fields."""
-
+        prompt = [
+            {"role": "system", "content": API_ANALYSIS_SYSTEM_PROMPT},
+            {"role": "user", "content": user_prompt}
+        ]
+        # 调用LLM
         try:
-            # Get GPT model
-            model = self.get_model()
-            
-            # Query GPT
-            response = model.predict([{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}])
-            
-            # Parse response
-            analysis_results = self.parse_api_analysis_json(response)
-            
-            # Add analysis to dataframe
-            for result in analysis_results:
-                if 'api_index' in result and 'analysis' in result:
-                    idx = result['api_index']
-                    if idx < len(api_candidates_df):
-                        api_candidates_df.iloc[idx, api_candidates_df.columns.get_loc('analysis')] = result['analysis']
-            
-            self.project_logger.info(f"  ==> Successfully analyzed {len(analysis_results)} APIs with GPT")
-            
+            response = client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=prompt,
+                temperature=0.3  # 降低随机性，保证格式稳定
+            )
+            llm_output = response.choices[0].message.content.strip()
         except Exception as e:
-            self.project_logger.error(f"  ==> Error analyzing APIs with GPT: {e}")
-            # Fill with placeholder if GPT analysis fails
-            api_candidates_df['analysis'] = 'Analysis failed'
-        
-        return api_candidates_df
+            print(f"LLM调用失败: {str(e)}")
+            return
 
-    def parse_api_analysis_json(self, json_str):
-        """
-        Parse the JSON response from GPT API analysis
-        """
-        try:
-            # Clean up the response
-            import re
-            json_str = json_str.replace("\\n", "").replace("\\\n", "")
-            json_str = re.sub("//.*", "", json_str)
-            json_str = re.sub("\"\"", "\"", json_str)
-            
-            # Try to extract JSON array
-            json_match = re.findall(r"\[[\s\S]*\]", json_str)
-            if json_match:
-                result = json.loads(json_match[0])
-                if isinstance(result, list):
-                    return result
-            
-            # Fallback: try to parse individual objects
-            results = re.findall(r"{[^}]*}", json_str)
-            if results:
-                return [json.loads(r.strip()) for r in results]
-                
-        except Exception as e:
-            self.project_logger.error(f"Error parsing API analysis JSON: {e}")
-            self.project_logger.error(f"Raw response: {json_str}")
-        
-        return []
+        # 解析结果：按序号提取每个API的分析（核心优化点）
+        analysis_results = []
+        # 用正则匹配带序号的行（例如"1. ...", "2. ..."）
+        pattern = re.compile(r'^(\d+)\. (.*)$', re.MULTILINE)
+        matches = pattern.findall(llm_output)  # 结果为[(序号, 分析内容), ...]
+
+        # 按API数量初始化结果列表
+        analysis_results = ["No analysis available"] * len(api_entries)
+        for num_str, content in matches:
+            try:
+                index = int(num_str) - 1  # 转换为0-based索引
+                if 0 <= index < len(api_entries):
+                    analysis_results[index] = content.strip()
+            except ValueError:
+                continue  # 忽略无效序号
+
+        # 写入输出CSV
+        with open(self.analysed_apis_csv_path, mode='w', newline='', encoding='utf-8') as outfile:
+            writer = csv.DictWriter(outfile, fieldnames=fieldnames)
+            writer.writeheader()
+
+            for i, entry in enumerate(api_entries):
+                new_row = entry['original_row'].copy()
+                new_row['analysis'] = analysis_results[i]
+                writer.writerow(new_row)
+
+        print(f"分析完成，结果已保存到 {self.analysed_apis_csv_path}")
+        # 打印匹配情况（方便调试）
+        print(
+            f"API总数: {len(api_entries)}, 成功匹配分析: {sum(1 for a in analysis_results if a != 'No analysis available')}")
 
     def func_parameter_has_non_trivial_parameter(self, row):
         param_types_raw = "" if type(row["parameter_types"]) == float else row["parameter_types"]
@@ -491,6 +487,99 @@ Format your response as a JSON array with objects containing 'api_index' (0-base
             func_param_candidates.to_csv(self.source_func_param_candidates_path, index=False, header=True, sep=",", encoding="utf-8")
         else:
             self.project_logger.info("  ==> Existing source function parameter candidates file found. Skipping filtering candidates...")
+
+    def read_methods_from_csv(file_path):
+        """从CSV文件读取方法信息"""
+        methods = []
+        fieldnames = []
+
+        with open(file_path, mode='r', encoding='utf-8') as file:
+            reader = csv.DictReader(file)
+            fieldnames = reader.fieldnames.copy()
+            for row in reader:
+                # 构建方法的完整标识字符串
+                method_info = f"{row['package']}.{row['clazz']}.{row['func']}: {row['full_signature']}"
+                if row.get('doc') and row['doc'].strip():
+                    method_info += f"\nDocumentation: {row['doc']}"
+
+                methods.append({
+                    'index': len(methods),
+                    'info': method_info,
+                    'row': row
+                })
+
+        return methods, fieldnames
+
+    def get_llm_analysis(methods):
+        """调用LLM接口获取方法分析结果"""
+        # 构建方法列表字符串
+        method_list_str = "\n\n".join([f"Method {i}:\n{method['info']}" for i, method in enumerate(methods)])
+
+        # 构建提示
+        prompt = [
+            {"role": "system", "content": METHOD_ANALYSIS_SYSTEM_PROMPT},
+            {"role": "user", "content": METHOD_ANALYSIS_USER_PROMPT.format(method_list=method_list_str)}
+        ]
+        client = OpenAI(
+            api_key="sk-T1Vt6PLIOoBll7c2CkCsNOqtqB6rsdLcdcfrUyiXcOZOYDAD",
+            base_url="https://api.chatanywhere.tech/v1"
+        )
+        try:
+            # 调用LLM API
+            response = client.chat.completions.create(
+                model="gpt-3.5-turbo",  # 可根据需要更换模型
+                messages=prompt,
+                temperature=0.3,  # 降低随机性，使结果更稳定
+                response_format={"type": "json_object"}
+            )
+
+            # 解析JSON响应
+            analysis_results = json.loads(response.choices[0].message.content)
+            return analysis_results
+
+        except Exception as e:
+            print(f"调用LLM接口时出错: {str(e)}")
+            return None
+
+    def write_analyzed_csv(methods, fieldnames, output_file):
+        """将包含分析结果的数据写入新CSV文件"""
+        # 添加新列到字段名
+        new_fieldnames = fieldnames + ['analysis']
+
+        with open(output_file, mode='w', encoding='utf-8', newline='') as file:
+            writer = csv.DictWriter(file, fieldnames=new_fieldnames)
+            writer.writeheader()
+
+            for method in methods:
+                # 复制原始行数据
+                new_row = method['row'].copy()
+                # 添加分析结果，如果有的话
+                new_row['analysis'] = method.get('analysis', 'No analysis available')
+                writer.writerow(new_row)
+
+    def analyze_internal_function_parameters(self):
+        """主函数：协调读取、分析和写入过程"""
+        print(f"从 {self.source_func_param_candidates_path} 读取方法数据...")
+        methods, fieldnames = self.read_methods_from_csv(self.source_func_param_candidates_path)
+        if not methods:
+            print("没有找到方法数据，程序退出。")
+            return
+
+        print(f"找到 {len(methods)} 个方法，正在请求LLM分析...")
+        analysis_results = self.get_llm_analysis(methods)
+
+        if analysis_results and 'analyses' in analysis_results:
+            # 将分析结果与方法匹配
+            for result in analysis_results['analyses']:
+                index = result['method_index']
+                if 0 <= index < len(methods):
+                    # 直接使用自然语言分析结果
+                    methods[index]['analysis'] = result['natural_language_analysis']
+
+        print(f"将分析结果写入 {self.analysed_func_params_path}...")
+        self.write_analyzed_csv(methods, fieldnames, self.analysed_func_params_path)
+
+        print("处理完成！")
 
     def load_cached_llm_labeled_apis(self):
         if os.path.exists(self.api_labels_cache_path):
@@ -1321,21 +1410,27 @@ Format your response as a JSON array with objects containing 'api_index' (0-base
         self.collect_invoked_external_apis()
         # self.cwe_output_path/candidate_apis.csv
 
-        # 2. Collect all the internal function parameters
+        #2.analyze all the invoked external APIS
+        self.analyze_apis()
+
+        # 3. Collect all the internal function parameters
         self.collect_internal_function_parameters()
         # self.common_output_path/source_func_param_candidates.csv
 
-        # 3. Query GPT for source/taint-propagator/sink from external APIs
+        # 4.Analyze all the internal function parameters
+        self.analyze_internal_function_parameters()
+
+        # 5. Query GPT for source/taint-propagator/sink from external APIs
         self.query_gpt_for_api_src_tp_sink_batched()
         #self.llm_labelled_sink_apis_path = f"{self.cwe_output_path}/llm_labelled_sink_apis.json"
         #self.llm_labelled_source_apis_path = f"{self.cwe_output_path}/llm_labelled_source_apis.json"
         #self.llm_labelled_taint_prop_apis_path = f"{self.cwe_output_path}/llm_labelled_taint_prop_apis.json"
 
-        # 4. Query GPT for sources among internal function parameters
+        # 6. Query GPT for sources among internal function parameters
         self.query_gpt_for_func_param_src()
         # self.llm_labelled_source_func_params_path = f"{self.common_output_path}/llm_labelled_source_func_params.json"
 
-        # 5. Build local query for this project
+        # 7. Build local query for this project
         self.build_project_specific_query()
         # # CodeQL queries temporary path
         # self.source_qll_path = f"{self.cwe_output_path}/MySources.qll"
@@ -1343,26 +1438,28 @@ Format your response as a JSON array with objects containing 'api_index' (0-base
         # self.sink_qll_path = f"{self.cwe_output_path}/MySinks.qll"
         # self.spec_yml_path = f"{self.cwe_output_path}/Spec.yml"
 
-        # 6. Send the local query for vulnerability detection
+        # 8. Send the local query for vulnerability detection
         self.find_vulnerability()
         # self.query_output_result_sarif_path = f"{self.query_output_path}/results.sarif"
         # self.query_output_result_csv_path = f"{self.query_output_path}/results.csv"
-        # 7. Do a post-processing step for rule-based filtering of paths
+
+        # 9. Do a post-processing step for rule-based filtering of paths
         self.post_process_cwe_query_result()
-        # 对CodeQL检测出的漏洞结果进行"后处理"，
+        # 对CodeQL检测出的漏洞结果进行“后处理”，
         # 过滤掉无效、无意义或误报的路径和告警，
         # 以提升最终输出结果的准确性和可用性
 
-        # 8. Do posthoc filtering
+        # 10. Do posthoc filtering
         self.query_gpt_for_posthoc_filtering()
         # self.posthoc_filtering_output_result_sarif_path = f"{self.posthoc_filtering_output_path}/results.sarif"
         # self.posthoc_filtering_output_result_json_path = f"{self.posthoc_filtering_output_path}/results.json"
         # self.posthoc_filtering_output_stats_json_path = f"{self.posthoc_filtering_output_path}/stats.json"
 
-        # 9. Evaluate performance
+        # 11. Evaluate performance
         self.evaluate_result()
         # self.final_output_json_path = f"{self.final_output_path}/results.json"
-        # 10. Debuggging
+
+        # 12. Debuggging
         self.debug_result()
 
 

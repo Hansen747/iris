@@ -17,6 +17,7 @@ Return the result as a json list with each object in the format:
 DO NOT OUTPUT ANYTHING OTHER THAN JSON.\
 """
 
+
 API_LABELLING_USER_PROMPT = """\
 {cwe_long_description}
 
@@ -30,6 +31,38 @@ what are the functions that are potential source, sink, or taint-propagators to 
 Package,Class,Method,Signature,Analysis
 {methods}
 """
+
+# 系统提示（强调全面分析，避免明确分类）
+API_ANALYSIS_SYSTEM_PROMPT = """\
+You are an expert security analyst specializing in API security.
+Analyze each API with a focus on practical security implications, usage patterns, and actionable considerations.
+- Each analysis must be 2-3 sentences covering:
+  1. Core functionality of the API
+  2. Potential security risks in common usage scenarios
+  3. Key precautions or best practices for safe implementation
+- Provide diverse considerations beyond simple classification; think about input validation, error handling, data exposure, and context-dependent risks.
+- Follow the output format strictly (numbered list matching input order).
+"""
+
+# 用户提示（优化示例，更注重多维度分析）
+API_ANALYSIS_USER_PROMPT = """
+{cwe_long_description}
+
+Example of a GOOD analysis (follow this structure):
+1. This API reads character data from a file stream. Insecure usage may expose sensitive files or enable path traversal attacks if file paths are not validated. Always restrict access to allowed directories and sanitize input paths.
+2. This API Extracts a portion of a string based on indices. Risks include index out-of-bounds errors if inputs are not validated, potentially leading to crashes or unintended data exposure. Validate indices against string length before use.
+
+Bad analysis (DO NOT do this):
+- "java.io.FileReader.read: reads data from files" (repeats signature, no security context)
+- "Handles strings. Be careful when using it." (too vague, no specific considerations)
+
+Relevant security context:
+{cwe_examples}
+
+Analyze the following APIs. Output a numbered list (matching input order) with your analysis:
+{api_list}
+"""
+
 
 FUNC_PARAM_LABELLING_SYSTEM_PROMPT = """\
 You are a security expert. \
@@ -66,23 +99,42 @@ Package,Class,Method,Doc
 {methods}
 """
 
-POSTHOC_FILTER_SYSTEM_PROMPT = """\
-You are an expert in detecting security vulnerabilities. \
-You are given the starting point (source) and the ending point (sink) of a dataflow path in a Java project that may be a potential vulnerability. \
-Analyze the given taint source and sink and predict whether the given dataflow can be part of a vulnerability or not, and store it as a boolean in "is_vulnerable". \
-Note that, the source must be either a) the formal parameter of a public library function which might be invoked by a downstream package, or b) the result of a function call that returns tainted input from end-user. \
-If the given source or sink do not satisfy the above criteria, mark the result as NOT VULNERABLE. \
-Please provide a very short explanation associated with the verdict. \
-Assume that the intermediate path has no sanitizer.
+# 系统提示和用户提示模板
+METHOD_ANALYSIS_SYSTEM_PROMPT = """\
+You are an expert in code security and taint analysis.
+Your task is to analyze methods to determine if they might be potential taint sources in a security context.
+A taint source is a method that may receive untrusted input from end-users, which could contain malicious content.
+Consider if the method handles user input, is used by downstream libraries, or processes external data.
+Provide your analysis in clear, natural language.
+"""
 
-Answer in JSON object with the following format:
+METHOD_ANALYSIS_USER_PROMPT = """Please analyze the following methods to determine if they could be potential taint sources in a security context.
 
-{ "explanation": <YOUR EXPLANATION>,
-  "source_is_false_positive": <true or false>,
-  "sink_is_false_positive": <true or false>,
-  "is_vulnerable": <true or false> }
+For each method, provide a brief, coherent analysis in natural language (2-3 sentences) covering:
+1. What this method does (using documentation if available)
+2. Whether it might receive malicious input from end-users
+3. Its potential as a taint source (high/medium/low/none)
+4. Key reasoning for your assessment
 
-Do not include anything else in the response.\
+{method_list}
+
+Format your response as a JSON object with a top-level key 'analyses', containing an array of objects with:
+- 'method_index' (0-based index matching the input list)
+- 'natural_language_analysis' (a single string with the natural language analysis)
+
+Example:
+{{
+    "analyses": [
+        {{
+            "method_index": 0,
+            "natural_language_analysis": "spark.Request.params retrieves route pattern parameter values. It likely receives malicious input from end-users and has high potential as a taint source since it directly handles untrusted user-provided parameters."
+        }},
+        {{
+            "method_index": 1,
+            "natural_language_analysis": "spark.Request.attribute gets attribute values from a request. It has medium potential as a taint source since attributes might contain user-derived data, though they're typically set by the application rather than directly from users."
+        }}
+    ]
+}}
 """
 
 POSTHOC_FILTER_USER_PROMPT = """\

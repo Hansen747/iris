@@ -1,4 +1,3 @@
-import os
 from tqdm.contrib.concurrent import thread_map
 from openai import OpenAI
 
@@ -20,8 +19,10 @@ class GPTModel(LLM):
         if ("openai_api_key" in kwargs) and (kwargs["openai_api_key"] is not None):
             api_key = kwargs["openai_api_key"]
         else:
-            api_key = os.getenv("OPENAI_API_KEY")
-        self.client = OpenAI(api_key=api_key)
+            api_key = "sk-T1Vt6PLIOoBll7c2CkCsNOqtqB6rsdLcdcfrUyiXcOZOYDAD"
+            base_url="https://api.chatanywhere.org/v1"
+            #api_key = os.getenv("OPENAI_API_KEY")
+        self.client = OpenAI(api_key=api_key,base_url=base_url)
         self.logprobs = None
         for k in _OPENAI_DEFAULT_PARAMS:
             if k in kwargs:
