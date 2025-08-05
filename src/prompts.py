@@ -95,7 +95,7 @@ and that the function can be called with potentially malicious end-user inputs? 
 If the package does not seem to be a library, just return empty list as the result. \
 Utility functions that are not related to the primary purpose of the package should also be ignored
 
-Package,Class,Method,Doc
+Package,Class,Method,Doc,Analysis
 {methods}
 """
 

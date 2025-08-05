@@ -592,7 +592,8 @@ class SAPipeline:
         :param candidates, a list of the following [(<package>, <class>, <method>, <signature>), ...]
         """
         llm_results = self.load_cached_llm_labeled_apis()
-        cached_apis = set([(item["package"], item["class"], item["method"], item["signature"]) for item in llm_results])
+        # cached_apis = set([(item["package"], item["class"], item["method"], item["signature"]) for item in llm_results])
+        cached_apis = set([(item["package"], item["class"], item["method"], item["signature"], item["analysis"]) for item in llm_results])
         remaining_apis = sorted(list(set(candidates).difference(cached_apis)))
         return remaining_apis
 
@@ -670,9 +671,10 @@ class SAPipeline:
         # Check if there is labelled sink/source/taint-propagator
         if not os.path.exists(self.llm_labelled_source_apis_path) or self.overwrite or self.overwrite_labelled_apis:
             # 1. Load the candidates
-            candidates_csv = pd.read_csv(self.candidate_apis_csv_path, keep_default_na=False)
-            candidates = [(row["package"], row["clazz"], row["func"], row["full_signature"]) for (_, row) in candidates_csv.iterrows()]
-
+            # candidates_csv = pd.read_csv(self.candidate_apis_csv_path, keep_default_na=False)
+            candidates_csv = pd.read_csv(self.analysed_apis_csv_path, keep_default_na=False)
+            # candidates = [(row["package"], row["clazz"], row["func"], row["full_signature"]) for (_, row) in candidates_csv.iterrows()]
+            candidates = [(row["package"], row["clazz"], row["func"], row["full_signature"],row["analysis"]) for (_, row) in candidates_csv.iterrows()]
             # 6. If the candidates are too many, exit
             if self.skip_huge_project and len(candidates) > self.skip_huge_project_num_apis_threshold:
                 self.project_logger.info("  ==> Skipping project due to it being too large...")
@@ -837,8 +839,8 @@ class SAPipeline:
             return doc_str[:MAX_DOC_LENGTH] + "..."
 
     def fetch_func_param_src_candidates(self):
-        candidates_csv = pd.read_csv(self.source_func_param_candidates_path, keep_default_na=False)
-
+        # candidates_csv = pd.read_csv(self.source_func_param_candidates_path, keep_default_na=False)
+        candidates_csv = pd.read_csv(self.analysed_func_params_path, keep_default_na=False)
         # Do deduplication
         dedup_map = {}
         for (_, row) in candidates_csv.iterrows():
@@ -852,8 +854,8 @@ class SAPipeline:
                     dedup_map[key] = row
 
         # Add doc into the candidates
-        candidates = [(key[0], key[1], key[2], row["full_signature"], self.extract_doc(row["doc"])) for (key, row) in dedup_map.items()]
-
+        # candidates = [(key[0], key[1], key[2], row["full_signature"], self.extract_doc(row["doc"])) for (key, row) in dedup_map.items()]
+        candidates = [(key[0], key[1], key[2], row["full_signature"], self.extract_doc(row["doc"]),row["analysis"]) for (key, row) in dedup_map.items()]
         # Count the number of functions with documentations
         num_with_docs = len([() for cand in candidates if cand[4] != ""])
         self.project_logger.info(f"  ==> #Candidate functions with source param: {len(candidates_csv)}; after deduplication: {len(candidates)}; with documentations: {num_with_docs}. Querying LLM...")
@@ -880,7 +882,7 @@ class SAPipeline:
             def process_candidate_batch(i):
                 # 4.1. Get the batch of to query candidates
                 batch = candidates[i:i + self.label_func_param_batch_size]
-                api_list_text = "\n".join([",".join([row[0], row[1], row[3], row[4]]) for row in batch])
+                api_list_text = "\n".join([",".join([row[0], row[1], row[3], row[4], row[5]]) for row in batch])
 
                 # 4.2. Build the user prompt and dump it
                 user_prompt = FUNC_PARAM_LABELLING_USER_PROMPT.format(
