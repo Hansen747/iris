@@ -34,32 +34,50 @@ Package,Class,Method,Signature,Analysis
 
 # 系统提示（强调全面分析，避免明确分类）
 API_ANALYSIS_SYSTEM_PROMPT = """\
-You are an expert security analyst specializing in API security.
-Analyze each API with a focus on practical security implications, usage patterns, and actionable considerations.
-- Each analysis must be 2-3 sentences covering:
-  1. Core functionality of the API
-  2. Potential security risks in common usage scenarios
-  3. Key precautions or best practices for safe implementation
-- Provide diverse considerations beyond simple classification; think about input validation, error handling, data exposure, and context-dependent risks.
-- Follow the output format strictly (numbered list matching input order).
+You are an expert security analyst specializing in taint analysis and API security. Your task is to analyze APIs to identify features relevant to taint analysis in the context of {cwe_description} (CWE-{cwe_id}).
+
+For API analysis, use a two-tier approach:
+1. For well-known libraries/frameworks (e.g., Vert.x, Spring, Java Standard Library) with publicly documented APIs: Use your existing knowledge of the library's design, common usage patterns, and official documentation to enhance analysis depth.
+2. For unknown or custom APIs: Base analysis SOLELY on observable clues (package, class name, method name, signature) without assuming implementation details.
+
+CWE Context: 
+{cwe_long_description} 
+
+Examples include: 
+{cwe_examples}
+
+Taint analysis fundamentals:
+- Potential sources: May introduce external/untrusted data (e.g., user input, network data)
+- Potential sinks: May perform sensitive operations (e.g., database queries, command execution)
+- Potential propagators: May transfer data without neutralizing taint
+
+Output format rules:
+- Single paragraph per API, starting with**[full_signature]**: 
+- Clearly distinguish between:
+  - Known facts (for well-known APIs: "As documented in Vert.x, this method...")
+  - Inferences (for any API: "Likely performs... based on naming/signature")
+  - Taint relevance: Specific features suggesting potential role as source/sink/propagator
+
+Analysis dimensions (must cover all):
+1. Functional behavior: What the API does (using known documentation where available)
+2. Data handling: How it processes input parameters and propagates data
+3. Security context: Relevance to {cwe_description} (CWE-{cwe_id})
+4. Taint potential: Specific attributes supporting potential classification (without definitive labeling)
+
+Use confident language for documented behaviors of well-known APIs, and tentative language for inferences from signature alone.
 """
 
 # 用户提示（优化示例，更注重多维度分析）
 API_ANALYSIS_USER_PROMPT = """
-{cwe_long_description}
 
-Example of a GOOD analysis (follow this structure):
-1. This API reads character data from a file stream. Insecure usage may expose sensitive files or enable path traversal attacks if file paths are not validated. Always restrict access to allowed directories and sanitize input paths.
-2. This API Extracts a portion of a string based on indices. Risks include index out-of-bounds errors if inputs are not validated, potentially leading to crashes or unintended data exposure. Validate indices against string length before use.
+Examples of HIGH-QUALITY analysis (follow this structure):
+1. **io.vertx.ext.web.RoutingContext.getBodyAsString()**: String: Per Vert.x docs, this method returns raw HTTP request body as String. It ingests untrusted client-supplied data with no implicit validation, directly crossing the trust boundary. Relevant to {cwe_description} (CWE-{cwe_id}) as a primary entry point for malicious input. Its role in exposing raw user data makes it a strong taint source candidate.
+   
+2. **java.lang.StringBuilder.append(String str)**: StringBuilder: Java's StringBuilder concatenates input String to its buffer, returning the modified instance. Transfers data without validation, aggregating potentially tainted content. While not directly exploiting {cwe_description}, it propagates taint through string aggregation, fitting taint-propagator .characteristics.
+   
+3. **com.example.data.Processor.transform(DataObject)**: DataObject: From signature clues, likely transforms DataObject instances (input → output). May handle internal data transfer, but transformation details are unknown. If DataObject contains user data, could propagate taint relevant to CWE-{cwe_id}, suggesting potential as a propagator.
 
-Bad analysis (DO NOT do this):
-- "java.io.FileReader.read: reads data from files" (repeats signature, no security context)
-- "Handles strings. Be careful when using it." (too vague, no specific considerations)
-
-Relevant security context:
-{cwe_examples}
-
-Analyze the following APIs. Output a numbered list (matching input order) with your analysis:
+Analyze the following APIs. Output a numbered list matching the input order:
 {api_list}
 """
 
@@ -135,6 +153,25 @@ Example:
         }}
     ]
 }}
+"""
+
+POSTHOC_FILTER_SYSTEM_PROMPT = """\
+You are an expert in detecting security vulnerabilities. \
+You are given the starting point (source) and the ending point (sink) of a dataflow path in a Java project that may be a potential vulnerability. \
+Analyze the given taint source and sink and predict whether the given dataflow can be part of a vulnerability or not, and store it as a boolean in "is_vulnerable". \
+Note that, the source must be either a) the formal parameter of a public library function which might be invoked by a downstream package, or b) the result of a function call that returns tainted input from end-user. \
+If the given source or sink do not satisfy the above criteria, mark the result as NOT VULNERABLE. \
+Please provide a very short explanation associated with the verdict. \
+Assume that the intermediate path has no sanitizer.
+
+Answer in JSON object with the following format:
+
+{ "explanation": <YOUR EXPLANATION>,
+  "source_is_false_positive": <true or false>,
+  "sink_is_false_positive": <true or false>,
+  "is_vulnerable": <true or false> }
+
+Do not include anything else in the response.\
 """
 
 POSTHOC_FILTER_USER_PROMPT = """\

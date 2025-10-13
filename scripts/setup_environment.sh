@@ -39,9 +39,10 @@ conda env create -f environment.yml
 # Create necessary directories
 echo "Creating directories..."
 PROJECT_ROOT=$(pwd)
+DATA_ROOT="/data1/VD_data"
 CODEQL_DIR="$PROJECT_ROOT/codeql"
 mkdir -p "$CODEQL_DIR"
-mkdir -p "$PROJECT_ROOT/data/codeql-dbs"
+mkdir -p "$DATA_ROOT/codeql-dbs"
 
 if [[ "$mac_codeql" == "true" ]]; then
     echo "Downloading CodeQL for osx-64..."
@@ -82,7 +83,7 @@ export PATH="$CODEQL_DIR:$PATH"
 echo "Setup completed successfully!"
 echo "- Conda environment 'iris' has been created"
 echo "- CodeQL has been downloaded and extracted to $CODEQL_DIR"
-echo "- Created '$PROJECT_ROOT/data/codeql-dbs' directory"
+echo "- Created '$DATA_ROOT/codeql-dbs' directory"
 echo "- Added CodeQL to PATH in ~/.bashrc"
 echo ""
 echo "To activate the environment, run: conda activate iris"

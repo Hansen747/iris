@@ -92,7 +92,12 @@ directories, and etc.""",
             "sink_args": [],
           "type": "taint-propagator",
         },
-      ]
+      ],
+      "cwe_examples":"""
+- Source: java.io.InputStreamReader.read() reads untrusted input
+- Sink: java.lang.Runtime.exec() executes system commands
+- Propagator: java.lang.String.concat() passes data without validation
+"""
     }
   },
   "cwe-022wLLMSinksOnly": {

@@ -1,0 +1,22 @@
+setup
+python3 data/cwe-bench-java/scripts/setup.py
+python3 data/cwe-bench-java/scripts/setup.py --no-build
+python3 data/cwe-bench-java/scripts/setup.py --filter apache__camel_CVE-2018-8041_2.20.3
+python3 data/cwe-bench-java/scripts/setup.py --cwe CWE-022 CWE-078 
+python3 data/cwe-bench-java/scripts/setup.py --filter keycloak 
+python3 data/cwe-bench-java/scripts/setup.py --exclude apache
+
+python3 scripts/build_codeql_dbs.py 
+python3 scripts/build_codeql_dbs.py --project dromara__hutool_CVE-2018-17297_4.1.11
+
+#不进行分析
+python3 src/neusym_vul.py --query cwe-022wLLM --run-id test01 --llm gpt-3.5 DSpace__DSpace_CVE-2016-10726_4.4 
+#使用--analysis参数进行分析
+python3 src/neusym_vul.py --query cwe-022wLLM --run-id test01 --llm gpt-3.5 --analysis --overwrite-llm-cache --overwrite-cwe-query-result DSpace__DSpace_CVE-2016-10726_4.4
+python3 src/neusym_vul.py --query cwe-022wLLM --run-id test01 --llm gpt-3.5 --analysis dromara__hutool_CVE-2018-17297_4.1.11
+#不使用缓存中的结果
+self.overwrite_llm_cache
+#重写api的分析结果
+self.overwrite_analyze_api
+#重写func的重写结果
+

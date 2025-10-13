@@ -2,6 +2,8 @@ import os
 import csv
 import sys
 import subprocess as sp
+import threading
+import time
 import pandas as pd
 import shutil
 import json
@@ -15,6 +17,10 @@ from openai import OpenAI  # 假设使用OpenAI兼容的API
 import requests
 from tqdm import tqdm
 from tqdm.contrib.concurrent import thread_map
+import concurrent.futures
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from sentence_transformers import SentenceTransformer
+from sklearn.metrics.pairwise import cosine_similarity
 
 THIS_SCRIPT_DIR = os.path.dirname(os.path.realpath(__file__))
 NEUROSYMSA_ROOT_DIR = os.path.abspath(f"{THIS_SCRIPT_DIR}/../")
@@ -95,6 +101,13 @@ class SAPipeline:
             debug_sink: bool = False,
             test_run: bool = False,
             no_logger: bool = False,
+            overwrite_analyze_api: bool = False,
+            overwrite_analyze_func: bool = False,
+            analysis: bool = False,
+            model_name: str = 'all-MiniLM-L6-v2',
+            similarity_threshold: float = 0.85,
+            skip_api_transmit: bool = False,
+            skip_func_transmit: bool = False
     ):
         # Store basic information
         self.project_name = project_name
@@ -130,6 +143,25 @@ class SAPipeline:
         self.debug_sink = debug_sink
         self.test_run = test_run
         self.no_logger = no_logger
+        self.overwrite_analyze_api = overwrite_analyze_api
+        self.overwrite_analyze_func = overwrite_analyze_func
+        self.analysis = analysis
+        self.skip_api_transmit = skip_api_transmit
+        self.skip_func_transmit = skip_func_transmit
+        # 标签传播相关参数和成员变量
+        self.model_name = model_name
+        self.similarity_threshold = similarity_threshold
+        self.vector_db_apis = []  # API向量数据库
+        self.vector_db_func_params = []  # 函数参数向量数据库
+        self.labelled_apis = {
+            'source': [],
+            'sink': [],
+            'taint-propagator': []
+        }  # 已标记的API
+        self.labelled_func_params = []  # 已标记的函数参数
+        
+        # 初始化句子转换模型
+        self.embedding_model = SentenceTransformer(model_name)
 
         # Setup logger
         if not self.no_logger:
@@ -172,7 +204,10 @@ class SAPipeline:
             .drop_duplicates()
 
         # Basic path information
-        self.project_output_path = f"{OUTPUT_DIR}/{self.project_name}/{self.run_id}"
+        if self.analysis:
+            self.project_output_path = f"{OUTPUT_DIR}/{self.project_name}/{self.run_id}_analysis"
+        else:
+            self.project_output_path = f"{OUTPUT_DIR}/{self.project_name}/{self.run_id}_non_analysis"
 
         # Setup codeql database path
         self.project_codeql_db_path = f"{CODEQL_DB_PATH}/{self.project_name}"
@@ -249,7 +284,10 @@ class SAPipeline:
             self.project_logger = None
 
         # Setup cache path
-        self.common_cache_path = f"{OUTPUT_DIR}/common/{self.run_id}/cwe-{self.cwe_id}"
+        if not self.analysis:
+            self.common_cache_path = f"{OUTPUT_DIR}/common/{self.run_id}_non_analysis/cwe-{self.cwe_id}"
+        else:
+            self.common_cache_path = f"{OUTPUT_DIR}/common/{self.run_id}_analysis/cwe-{self.cwe_id}"
         if not os.path.exists(self.common_cache_path):
             os.makedirs(self.common_cache_path, exist_ok=True)
         self.api_labels_cache_path = f"{self.common_cache_path}/api_labels_{self.llm}.json"
@@ -341,7 +379,7 @@ class SAPipeline:
             possible_src_snk_tp = external_api_candidates.apply(lambda row: self.api_is_candidate(row, num_external_apis), axis=1)
             #self.api_is_candidate 方法会根据某些条件判断该行代表的API是否是候选API。这些条件包括：
             # 是否在黑名单中（通过 self.api_candidate_not_on_blacklist 方法判断）。
-            # 是否属于固定的模块（通过 self.api_candidate_is_in_fixed_module 方法判断）。
+            # 是否属于的模块（通过 self.api_candidate_is_in_fixed_module 方法判断）。
             # 是否具有非平凡的返回类型（通过 self.api_candidate_has_non_trivial_return 方法判断）。
             # 是否具有非平凡的参数类型（通过 self.api_candidate_has_non_trivial_parameter 方法判断）。
             external_api_candidates = external_api_candidates[possible_src_snk_tp]
@@ -357,83 +395,170 @@ class SAPipeline:
         else:
             self.project_logger.info("  ==> Existing candidate APIs file found. Skipping filtering candidates...")
 
-    def analyze_apis(self):
+    def process_batch(self,batch_num, api_batch, start_idx, model_id, result_list, lock):
+    #"""处理单个批次的API分析，线程安全的实现"""
+        batch_length = len(api_batch)
+        print(f"线程 {threading.current_thread().name} 开始处理批次 {batch_num + 1}，包含 {batch_length} 个API")
+
+        # 生成当前批次的API列表（带本地序号）
+        api_list = "\n".join([
+            f"{i + 1}. {e['original_row']['package']}.{e['original_row']['clazz']}.{e['original_row']['func']}: {e['full_signature']}"
+            for i, e in enumerate(api_batch)
+        ])
+        # 获取CWE信息
+        try:
+            cwe_description = QUERIES[self.query]["prompts"]["desc"]
+            cwe_long_description = QUERIES[self.query]["prompts"]["long_desc"]
+            cwe_examples = json.dumps(QUERIES[self.query]["prompts"]["examples"], indent=2)
+        except KeyError as e:
+            self.project_logger.error(f"CWE信息获取失败: 缺少键 {str(e)}")
+            return
+        # 构建提示
+        user_prompt = API_ANALYSIS_USER_PROMPT.format(
+            api_list=api_list,
+            cwe_id=self.cwe_id,
+            cwe_description=cwe_description
+        )
+        system_prompt = API_ANALYSIS_SYSTEM_PROMPT.format(
+                    cwe_description=cwe_description,
+                    cwe_id=self.cwe_id,
+                    cwe_long_description=cwe_long_description,
+                    cwe_examples=cwe_examples)
+        prompt = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
         # 配置LLM客户端 - 根据实际使用的API进行调整
         client = OpenAI(
             api_key="sk-T1Vt6PLIOoBll7c2CkCsNOqtqB6rsdLcdcfrUyiXcOZOYDAD",
-            base_url="https://api.chatanywhere.tech/v1"
+            base_url="https://api.chatanywhere.org/v1"
         )
-        # 读取CSV并收集API
-        api_entries = []
-        with open(self.candidate_apis_csv_path, mode='r', newline='', encoding='utf-8') as infile:
-            reader = csv.DictReader(infile)
-            fieldnames = reader.fieldnames + ['analysis']
-
-            for row in reader:
-                api_entries.append({
-                    'original_row': row,
-                    'full_signature': row['full_signature']  # 用于日志核对
-                })
-        # 生成API列表（带序号，方便LLM对应）
-        api_list = "\n".join([
-            f"{i + 1}. {e['original_row']['package']}.{e['original_row']['clazz']}.{e['original_row']['func']}: {e['full_signature']}"
-            for i, e in enumerate(api_entries)
-        ])
-        cwe_long_description = QUERIES[self.query]["prompts"]["long_desc"]
-        cwe_examples = json.dumps(QUERIES[self.query]["prompts"]["examples"], indent=2)#cwe_examples可能需要重写
-        # 构建提示
-        user_prompt = API_ANALYSIS_USER_PROMPT.format(
-            cwe_long_description=cwe_long_description,
-            cwe_examples=cwe_examples,
-            api_list=api_list
-        )
-
-        prompt = [
-            {"role": "system", "content": API_ANALYSIS_SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt}
-        ]
         # 调用LLM
         try:
             response = client.chat.completions.create(
-                model="gpt-3.5-turbo",
+                model=model_id,
                 messages=prompt,
-                temperature=0.3  # 降低随机性，保证格式稳定
+                temperature=0.3
             )
             llm_output = response.choices[0].message.content.strip()
+            # self.project_logger.info(f"线程 {threading.current_thread().name} 批次 {batch_num + 1} LLM输出: {llm_output}")
+            print(f"线程 {threading.current_thread().name} 完成批次 {batch_num + 1} 分析")
         except Exception as e:
-            print(f"LLM调用失败: {str(e)}")
-            return
+            self.project_logger.error(f"线程 {threading.current_thread().name} 处理批次 {batch_num + 1} 失败: {str(e)}")
+            print(f"线程 {threading.current_thread().name} 处理批次 {batch_num + 1} 失败: {str(e)}")
+            return batch_num, 0  # 返回失败的批次号和0匹配数
 
-        # 解析结果：按序号提取每个API的分析（核心优化点）
-        analysis_results = []
-        # 用正则匹配带序号的行（例如"1. ...", "2. ..."）
+        # 解析结果
         pattern = re.compile(r'^(\d+)\. (.*)$', re.MULTILINE)
-        matches = pattern.findall(llm_output)  # 结果为[(序号, 分析内容), ...]
+        matches = pattern.findall(llm_output)
 
-        # 按API数量初始化结果列表
-        analysis_results = ["No analysis available"] * len(api_entries)
-        for num_str, content in matches:
-            try:
-                index = int(num_str) - 1  # 转换为0-based索引
-                if 0 <= index < len(api_entries):
-                    analysis_results[index] = content.strip()
-            except ValueError:
-                continue  # 忽略无效序号
+        # 线程安全地更新结果列表（使用锁避免竞争条件）
+        batch_matches = 0
+        with lock:
+            for num_str, content in matches:
+                try:
+                    batch_index = int(num_str) - 1
+                    global_index = start_idx + batch_index
+                    if 0 <= batch_index < batch_length and 0 <= global_index < len(result_list):
+                        result_list[global_index] = content.strip()
+                        batch_matches += 1
+                except ValueError:
+                    continue
 
-        # 写入输出CSV
-        with open(self.analysed_apis_csv_path, mode='w', newline='', encoding='utf-8') as outfile:
-            writer = csv.DictWriter(outfile, fieldnames=fieldnames)
-            writer.writeheader()
+        print(f"线程 {threading.current_thread().name} 批次 {batch_num + 1} 匹配结果: {batch_matches}/{batch_length}")
+        return batch_num, batch_matches
 
-            for i, entry in enumerate(api_entries):
-                new_row = entry['original_row'].copy()
-                new_row['analysis'] = analysis_results[i]
-                writer.writerow(new_row)
+    def analyze_apis(self,model_id="gpt-3.5-turbo", batch_size=15, max_workers=8):
+    # """
+    # 多线程分析API与CWE漏洞的关联
+    
+    # 参数:
+    #     max_workers: 最大线程数，根据API并发限制调整
+    # """
+        self.project_logger.info("==> Stage 2: analyze external APIs...")
+        if not self.analysis:
+            self.project_logger.info("==>No need for analysis， skip this step.")
+        else:
+            if not os.path.exists(self.analysed_apis_csv_path) or self.overwrite or self.overwrite_analyze_api:
+            # 读取CSV并收集API
+                api_entries = []
+                with open(self.candidate_apis_csv_path, mode='r', newline='', encoding='utf-8') as infile:
+                    reader = csv.DictReader(infile)
+                    fieldnames = reader.fieldnames + ['analysis']
 
-        print(f"分析完成，结果已保存到 {self.analysed_apis_csv_path}")
-        # 打印匹配情况（方便调试）
-        print(
-            f"API总数: {len(api_entries)}, 成功匹配分析: {sum(1 for a in analysis_results if a != 'No analysis available')}")
+                    for row in reader:
+                        api_entries.append({
+                            'original_row': row,
+                            'full_signature': row['full_signature']
+                        })
+                
+                total_apis = len(api_entries)
+                print(f"发现 {total_apis} 个API需要分析")
+                self.project_logger.info(f"发现 {total_apis} 个API需要分析")
+                
+                if total_apis == 0:
+                    print("没有API需要分析，直接退出")
+                    self.project_logger.info("没有API需要分析，直接退出")
+                    return
+                
+                # 初始化分析结果列表和线程锁
+                analysis_results = ["No analysis available"] * total_apis
+                result_lock = threading.Lock()  # 保证结果写入的线程安全
+                
+                # 计算批次数并生成批次列表
+                num_batches = (total_apis + batch_size - 1) // batch_size
+                batches = []
+                for batch_num in range(num_batches):
+                    start_idx = batch_num * batch_size
+                    end_idx = min((batch_num + 1) * batch_size, total_apis)
+                    batches.append((batch_num, api_entries[start_idx:end_idx], start_idx))
+                
+                print(f"将分为 {num_batches} 批进行分析，每批最多 {batch_size} 个API，使用 {max_workers} 个线程")
+                self.project_logger.info(f"将分为 {num_batches} 批进行分析，每批最多 {batch_size} 个API，使用 {max_workers} 个线程")
+                
+                # 多线程处理所有批次
+                total_matches = 0
+                with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="API-Analyzer") as executor:
+                    # 提交所有任务
+                    futures = [
+                        executor.submit(
+                            self.process_batch, 
+                            batch_num, 
+                            batch_data, 
+                            start_idx, 
+                            model_id, 
+                            analysis_results, 
+                            result_lock
+                        ) 
+                        for batch_num, batch_data, start_idx in batches
+                    ]
+                    
+                    # 等待所有任务完成并统计结果
+                    for future in as_completed(futures):
+                        try:
+                            batch_num, batch_matches = future.result()
+                            total_matches += batch_matches
+                        except Exception as e:
+                            print(f"处理批次时发生意外错误: {str(e)}")
+                            self.project_logger.error(f"处理批次时发生意外错误: {str(e)}")
+                
+                # 写入输出CSV
+                with open(self.analysed_apis_csv_path, mode='w', newline='', encoding='utf-8') as outfile:
+                    writer = csv.DictWriter(outfile, fieldnames=fieldnames)
+                    writer.writeheader()
+                    
+                    for i, entry in enumerate(api_entries):
+                        new_row = entry['original_row'].copy()
+                        new_row['analysis'] = analysis_results[i]
+                        writer.writerow(new_row)
+                
+                print(f"\n分析完成，结果已保存到 {self.analysed_apis_csv_path}")
+                print(f"API总数: {total_apis}, 成功匹配分析: {total_matches}")
+                self.project_logger.info(f"分析完成，结果已保存到 {self.analysed_apis_csv_path}，API总数: {total_apis}, 成功匹配分析: {total_matches}")
+            else:
+                self.project_logger.info("  ==> 已存在分析结果，跳过分析...")
+    
+
 
     def func_parameter_has_non_trivial_parameter(self, row):
         param_types_raw = "" if type(row["parameter_types"]) == float else row["parameter_types"]
@@ -457,7 +582,7 @@ class SAPipeline:
             return False
 
     def collect_internal_function_parameters(self):
-        self.project_logger.info("==> Stage 2: Collecting internal function parameters...")
+        self.project_logger.info("==> Stage 3: Collecting internal function parameters...")
 
         # 1. Invoke CodeQL to extract the internal function parameters
         if not os.path.exists(self.func_param_path) or self.overwrite or self.overwrite_func_param_candidates:
@@ -488,11 +613,10 @@ class SAPipeline:
         else:
             self.project_logger.info("  ==> Existing source function parameter candidates file found. Skipping filtering candidates...")
 
-    def read_methods_from_csv(file_path):
+    def read_methods_from_csv(self,file_path):
         """从CSV文件读取方法信息"""
         methods = []
         fieldnames = []
-
         with open(file_path, mode='r', encoding='utf-8') as file:
             reader = csv.DictReader(file)
             fieldnames = reader.fieldnames.copy()
@@ -510,10 +634,16 @@ class SAPipeline:
 
         return methods, fieldnames
 
-    def get_llm_analysis(methods):
-        """调用LLM接口获取方法分析结果"""
-        # 构建方法列表字符串
-        method_list_str = "\n\n".join([f"Method {i}:\n{method['info']}" for i, method in enumerate(methods)])
+    def process_single_batch(self,batch_data):
+        """处理单个批次的LLM分析（供多线程调用）"""
+        batch_num, current_batch, start_idx, total_batches = batch_data
+        print(f"开始处理第 {batch_num + 1}/{total_batches} 批...")
+
+        # 构建当前批次的方法列表字符串
+        method_list_str = "\n\n".join([
+            f"Method {i + start_idx}:\n{method['info']}" 
+            for i, method in enumerate(current_batch)
+        ])
 
         # 构建提示
         prompt = [
@@ -522,65 +652,89 @@ class SAPipeline:
         ]
         client = OpenAI(
             api_key="sk-T1Vt6PLIOoBll7c2CkCsNOqtqB6rsdLcdcfrUyiXcOZOYDAD",
-            base_url="https://api.chatanywhere.tech/v1"
+            base_url="https://api.chatanywhere.org/v1"
         )
+
         try:
-            # 调用LLM API
             response = client.chat.completions.create(
-                model="gpt-3.5-turbo",  # 可根据需要更换模型
+                model="gpt-3.5-turbo",
                 messages=prompt,
-                temperature=0.3,  # 降低随机性，使结果更稳定
+                temperature=0.3,
                 response_format={"type": "json_object"}
             )
-
-            # 解析JSON响应
-            analysis_results = json.loads(response.choices[0].message.content)
-            return analysis_results
-
+            result = json.loads(response.choices[0].message.content)
+            print(f"第 {batch_num + 1}/{total_batches} 批处理完成")
+            return result.get('analyses', []) if result else []
+        
         except Exception as e:
-            print(f"调用LLM接口时出错: {str(e)}")
-            return None
+            print(f"第 {batch_num + 1}/{total_batches} 批处理失败: {str(e)}")
+            return []
 
-    def write_analyzed_csv(methods, fieldnames, output_file):
+    def write_analyzed_csv(self,methods,fieldnames):
         """将包含分析结果的数据写入新CSV文件"""
-        # 添加新列到字段名
-        new_fieldnames = fieldnames + ['analysis']
+        new_fieldnames = fieldnames + ['analysis'] if fieldnames else ['analysis']
 
-        with open(output_file, mode='w', encoding='utf-8', newline='') as file:
+        with open(self.analysed_func_params_path, mode='w', encoding='utf-8', newline='') as file:
             writer = csv.DictWriter(file, fieldnames=new_fieldnames)
             writer.writeheader()
 
             for method in methods:
-                # 复制原始行数据
                 new_row = method['row'].copy()
-                # 添加分析结果，如果有的话
                 new_row['analysis'] = method.get('analysis', 'No analysis available')
                 writer.writerow(new_row)
 
-    def analyze_internal_function_parameters(self):
-        """主函数：协调读取、分析和写入过程"""
-        print(f"从 {self.source_func_param_candidates_path} 读取方法数据...")
-        methods, fieldnames = self.read_methods_from_csv(self.source_func_param_candidates_path)
-        if not methods:
-            print("没有找到方法数据，程序退出。")
-            return
+    def analyze_internal_function_parameters(self, batch_size=40,MAX_WORKERS = 5):
+        self.project_logger.info("==> Stage 4: analyze internal function parameters...")
+        if not self.analysis:
+            self.project_logger.info("==>No need for analysis， skip this step.")
+        else:
+            if not os.path.exists(self.analysed_func_params_path) or self.overwrite or self.overwrite_analyze_func:
+                """主函数：使用多线程并行处理批次分析"""
+                print(f"从 {self.source_func_param_candidates_path} 读取方法数据...")
+                methods, fieldnames = self.read_methods_from_csv(self.source_func_param_candidates_path)
+                if not methods:
+                    print("没有找到方法数据，程序退出。")
+                    new_fieldnames = fieldnames + ['analysis'] if fieldnames else ['analysis']
+                    with open(self.analysed_func_params_path, mode='w', encoding='utf-8', newline='') as file:
+                        writer = csv.DictWriter(file, fieldnames=new_fieldnames)
+                        writer.writeheader()
+                    return
 
-        print(f"找到 {len(methods)} 个方法，正在请求LLM分析...")
-        analysis_results = self.get_llm_analysis(methods)
+                total_methods = len(methods)
+                total_batches = (total_methods + batch_size - 1) // batch_size
+                print(f"找到 {total_methods} 个方法，分为 {total_batches} 批，使用 {MAX_WORKERS} 个线程并行处理...")
 
-        if analysis_results and 'analyses' in analysis_results:
-            # 将分析结果与方法匹配
-            for result in analysis_results['analyses']:
-                index = result['method_index']
-                if 0 <= index < len(methods):
-                    # 直接使用自然语言分析结果
-                    methods[index]['analysis'] = result['natural_language_analysis']
+                # 准备批次数据
+                batch_tasks = []
+                for batch_num in range(total_batches):
+                    start_idx = batch_num * batch_size
+                    end_idx = min((batch_num + 1) * batch_size, total_methods)
+                    current_batch = methods[start_idx:end_idx]
+                    batch_tasks.append((batch_num, current_batch, start_idx, total_batches))
 
-        print(f"将分析结果写入 {self.analysed_func_params_path}...")
-        self.write_analyzed_csv(methods, fieldnames, self.analysed_func_params_path)
+                # 多线程并行处理所有批次
+                all_analysis_results = []
+                with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                    # 提交所有批次任务并获取结果
+                    futures = [executor.submit(self.process_single_batch, task) for task in batch_tasks]
+                    
+                    # 收集所有结果
+                    for future in concurrent.futures.as_completed(futures):
+                        batch_results = future.result()
+                        all_analysis_results.extend(batch_results)
 
-        print("处理完成！")
+                # 合并分析结果
+                if all_analysis_results:
+                    for result in all_analysis_results:
+                        index = result['method_index']
+                        if 0 <= index < len(methods):
+                            methods[index]['analysis'] = result.get('natural_language_analysis', 'No analysis available')
 
+                print(f"将分析结果写入 {self.analysed_func_params_path}...")
+                self.write_analyzed_csv(methods, fieldnames)
+                print("所有处理完成！")
+            else:
+                self.project_logger.info("  ==> Existing analyzed Funcs file found. Skipping analyze Funcs...")
     def load_cached_llm_labeled_apis(self):
         if os.path.exists(self.api_labels_cache_path):
             return json.load(open(self.api_labels_cache_path))
@@ -592,9 +746,10 @@ class SAPipeline:
         :param candidates, a list of the following [(<package>, <class>, <method>, <signature>), ...]
         """
         llm_results = self.load_cached_llm_labeled_apis()
-        # cached_apis = set([(item["package"], item["class"], item["method"], item["signature"]) for item in llm_results])
-        cached_apis = set([(item["package"], item["class"], item["method"], item["signature"], item["analysis"]) for item in llm_results])
-        remaining_apis = sorted(list(set(candidates).difference(cached_apis)))
+        cached_apis = set([(item["package"], item["class"], item["method"], item["signature"]) for item in llm_results])
+        # remaining_apis = sorted(list(set(candidates).difference(cached_apis)))
+        # 只取前四个元素用于比较
+        remaining_apis = sorted([item for item in candidates if (item[0], item[1], item[2], item[3]) not in cached_apis])
         return remaining_apis
 
     def merge_llm_labeled_apis_and_cache(self, candidates, new_llm_result):
@@ -604,7 +759,7 @@ class SAPipeline:
 
         result = []
         for item in candidates:
-            item_key = ",".join(item)
+            item_key = ",".join(item[:4])
             if item_key in new_llm_mapping:
                 result.append(new_llm_mapping[item_key])
             elif item_key in cached_mapping:
@@ -624,19 +779,21 @@ class SAPipeline:
         cached_apis = {(item["package"], item["class"], item["method"], item["signature"]): item for item in cache}
         llm_returned_apis = {(item["package"], item["class"], item["method"], item["signature"]): item for item in new_llm_result}
         for item in candidates:
-            if item in cached_apis:
-                if item in llm_returned_apis:
-                    cached_apis[item]["type"] = llm_returned_apis[item].get("type", "none")
+            key = item[:4]  # 只取前四个元素作为key
+            if key in cached_apis:
+                if key in llm_returned_apis:
+                    cached_apis[key]["type"] = llm_returned_apis[key].get("type", "none")
                 else:
-                    cached_apis[item]["type"] = "none"
+                    cached_apis[key]["type"] = "none"
             else:
-                if item in llm_returned_apis:
-                    to_cache_obj = {k: v for (k, v) in llm_returned_apis[item].items()}
+                if key in llm_returned_apis:
+                    to_cache_obj = {k: v for (k, v) in llm_returned_apis[key].items()}
                 else:
-                    to_cache_obj = {"package": item[0], "class": item[1], "method": item[2], "signature": item[3], "type": "none"}
-                cached_apis[item] = to_cache_obj
+                    to_cache_obj = {"package": key[0], "class": key[1], "method": key[2], "signature": key[3], "type": "none"}
+                cached_apis[key] = to_cache_obj
         reload_cache = [cached_apis[item] for item in sorted(cached_apis.keys())]
         json.dump(reload_cache, open(self.api_labels_cache_path, "w"), indent=2)
+        #存储的是结果的json列表
 
     def parse_json(self, json_str):
         try:
@@ -666,15 +823,20 @@ class SAPipeline:
         return []
 
     def query_gpt_for_api_src_tp_sink_batched(self):
-        self.project_logger.info("==> Stage 3: Querying GPT for source/taint-prop/sink APIs...")
+        self.project_logger.info("==> Stage 5: Querying GPT for source/taint-prop/sink APIs...")
 
-        # Check if there is labelled sink/source/taint-propagator
+        # Check if there is labelled sink/source/propagataint-propagator
         if not os.path.exists(self.llm_labelled_source_apis_path) or self.overwrite or self.overwrite_labelled_apis:
             # 1. Load the candidates
-            # candidates_csv = pd.read_csv(self.candidate_apis_csv_path, keep_default_na=False)
-            candidates_csv = pd.read_csv(self.analysed_apis_csv_path, keep_default_na=False)
-            # candidates = [(row["package"], row["clazz"], row["func"], row["full_signature"]) for (_, row) in candidates_csv.iterrows()]
-            candidates = [(row["package"], row["clazz"], row["func"], row["full_signature"],row["analysis"]) for (_, row) in candidates_csv.iterrows()]
+            if self.analysis:
+                self.project_logger.info("API is already analysed. Loading candidates from analysed APIs CSV...")
+                candidates_csv = pd.read_csv(self.analysed_apis_csv_path, keep_default_na=False)
+                candidates = [(row["package"], row["clazz"], row["func"], row["full_signature"],row["analysis"]) for (_, row) in candidates_csv.iterrows()]
+            else:
+                self.project_logger.info("API is not analysed. Loading candidates from candidate APIs CSV...")
+                candidates_csv = pd.read_csv(self.candidate_apis_csv_path, keep_default_na=False)
+                candidates = [(row["package"], row["clazz"], row["func"], row["full_signature"]) for (_, row) in candidates_csv.iterrows()]
+            
             # 6. If the candidates are too many, exit
             if self.skip_huge_project and len(candidates) > self.skip_huge_project_num_apis_threshold:
                 self.project_logger.info("  ==> Skipping project due to it being too large...")
@@ -685,6 +847,7 @@ class SAPipeline:
                 to_query_candidates = candidates
             else:
                 to_query_candidates = self.filter_to_query_apis_with_cache(candidates)
+                # to_query_candidates = candidates
             num_cached_candidates = len(candidates) - len(to_query_candidates)
             self.project_logger.info(f"  ==> Querying GPT... #Candidates: {len(candidates)}, #To Query APIs: {len(to_query_candidates)}, #Cached: {num_cached_candidates}")
 
@@ -737,7 +900,9 @@ class SAPipeline:
                 merged_llm_results.extend(indiv_result)
             merged_llm_results=self.filter_invalid_entries(merged_llm_results)
             # 7. Save the result for this project
-            merged_overall_results = self.merge_llm_labeled_apis_and_cache(candidates, merged_llm_results)
+
+            merged_overall_results = self.merge_llm_labeled_apis_and_cache(candidates, merged_llm_results)#结果是llm的所有结果和缓存中的非none结果的合并
+            # merged_overall_results = merged_llm_results
             sources = [r for r in merged_overall_results if r.get("type", "") == "source"]
             taint_props = [r for r in merged_overall_results if r.get("type", "") == "taint-propagator"]
             sinks = [r for r in merged_overall_results if r.get("type", "") == "sink"]
@@ -839,32 +1004,56 @@ class SAPipeline:
             return doc_str[:MAX_DOC_LENGTH] + "..."
 
     def fetch_func_param_src_candidates(self):
-        # candidates_csv = pd.read_csv(self.source_func_param_candidates_path, keep_default_na=False)
-        candidates_csv = pd.read_csv(self.analysed_func_params_path, keep_default_na=False)
-        # Do deduplication
-        dedup_map = {}
-        for (_, row) in candidates_csv.iterrows():
-            key = (row["package"], row["clazz"], row["func"])
-            if key not in dedup_map:
-                dedup_map[key] = row
-            else:
-                if row["doc"] != "":
+        if self.analysis:
+            self.project_logger.info("Fetching source function parameter candidates from analysed CSV...")
+            candidates_csv = pd.read_csv(self.analysed_func_params_path, keep_default_na=False)
+            # Do deduplication
+            dedup_map = {}
+            for (_, row) in candidates_csv.iterrows():
+                key = (row["package"], row["clazz"], row["func"])
+                if key not in dedup_map:
                     dedup_map[key] = row
-                elif len(row["full_signature"]) > len(dedup_map[key]["full_signature"]):
+                else:
+                    if row["doc"] != "":
+                        dedup_map[key] = row
+                    elif len(row["full_signature"]) > len(dedup_map[key]["full_signature"]):
+                        dedup_map[key] = row
+
+            # Add doc into the candidates
+            # candidates = [(key[0], key[1], key[2], row["full_signature"], self.extract_doc(row["doc"])) for (key, row) in dedup_map.items()]
+            candidates = [(key[0], key[1], key[2], row["full_signature"], self.extract_doc(row["doc"]),row["analysis"]) for (key, row) in dedup_map.items()]
+            # Count the number of functions with documentations
+            num_with_docs = len([() for cand in candidates if cand[4] != ""])
+            self.project_logger.info(f"  ==> #Candidate functions with source param: {len(candidates_csv)}; after deduplication: {len(candidates)}; with documentations: {num_with_docs}. Querying LLM...")
+
+            # Return
+            return candidates
+        else:
+            self.project_logger.info("Fetching source function parameter candidates from candidates CSV...")
+            candidates_csv = pd.read_csv(self.source_func_param_candidates_path, keep_default_na=False)
+            # Do deduplication
+            dedup_map = {}
+            for (_, row) in candidates_csv.iterrows():
+                key = (row["package"], row["clazz"], row["func"])
+                if key not in dedup_map:
                     dedup_map[key] = row
+                else:
+                    if row["doc"] != "":
+                        dedup_map[key] = row
+                    elif len(row["full_signature"]) > len(dedup_map[key]["full_signature"]):
+                        dedup_map[key] = row
 
-        # Add doc into the candidates
-        # candidates = [(key[0], key[1], key[2], row["full_signature"], self.extract_doc(row["doc"])) for (key, row) in dedup_map.items()]
-        candidates = [(key[0], key[1], key[2], row["full_signature"], self.extract_doc(row["doc"]),row["analysis"]) for (key, row) in dedup_map.items()]
-        # Count the number of functions with documentations
-        num_with_docs = len([() for cand in candidates if cand[4] != ""])
-        self.project_logger.info(f"  ==> #Candidate functions with source param: {len(candidates_csv)}; after deduplication: {len(candidates)}; with documentations: {num_with_docs}. Querying LLM...")
+            # Add doc into the candidates
+            candidates = [(key[0], key[1], key[2], row["full_signature"], self.extract_doc(row["doc"])) for (key, row) in dedup_map.items()]
+            # Count the number of functions with documentations
+            num_with_docs = len([() for cand in candidates if cand[4] != ""])
+            self.project_logger.info(f"  ==> #Candidate functions with source param: {len(candidates_csv)}; after deduplication: {len(candidates)}; with documentations: {num_with_docs}. Querying LLM...")
 
-        # Return
-        return candidates
+            # Return
+            return candidates
 
     def query_gpt_for_func_param_src(self):
-        self.project_logger.info("==> Stage 4: Querying GPT for source function parameters...")
+        self.project_logger.info("==> Stage 6: Querying GPT for source function parameters...")
         if not os.path.exists(self.llm_labelled_source_func_params_path) or self.overwrite or self.overwrite_labelled_func_param:
             # 1. Get LLM and fetch information used for prompt
             system_prompt = FUNC_PARAM_LABELLING_SYSTEM_PROMPT
@@ -882,7 +1071,10 @@ class SAPipeline:
             def process_candidate_batch(i):
                 # 4.1. Get the batch of to query candidates
                 batch = candidates[i:i + self.label_func_param_batch_size]
-                api_list_text = "\n".join([",".join([row[0], row[1], row[3], row[4], row[5]]) for row in batch])
+                if not self.analysis:
+                    api_list_text = "\n".join([",".join([row[0], row[1], row[3], row[4]]) for row in batch])
+                else:
+                    api_list_text = "\n".join([",".join([row[0], row[1], row[3], row[4], row[5]]) for row in batch])
 
                 # 4.2. Build the user prompt and dump it
                 user_prompt = FUNC_PARAM_LABELLING_USER_PROMPT.format(
@@ -929,7 +1121,396 @@ class SAPipeline:
         return isinstance(d, dict) and all([d.get(k, None) for k in keys])
 
     def filter_invalid_entries(self, api_list):
-        return [api for api in api_list if self.not_none(api, ["method", "class", "package", "signature"])]
+        return [api for api in api_list if self.not_none(api, ["method", "class", "package","signature"])]
+
+    def label_transmit_with_rag(self):
+        self.project_logger.info("==> Stage 8: RAG for label transfer...")
+        if not self.analysis:
+            self.project_logger.info("==>No need for analysis， skip this step.")
+            return
+        else:
+            print("=== 开始API标签传播流程 ===")
+            if not self.skip_api_transmit:
+                self.propagate_api_labels()
+            print("\n=== 开始函数参数标签传播流程 ===")
+            if not self.skip_func_transmit:
+                self.propagate_func_param_labels()
+            return
+
+    # ------------------------------
+    # API标签传播相关方法
+    # ------------------------------
+    def load_analysed_apis(self):
+        """加载分析过的API数据并构建向量知识库"""
+        print(f"加载并处理API数据: {self.analysed_apis_csv_path}")
+
+        if not os.path.exists(self.analysed_apis_csv_path):
+            print(f"API数据文件不存在: {self.analysed_apis_csv_path}")
+            return
+
+        with open(self.analysed_apis_csv_path, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                # 对analysis文本进行向量化
+                analysis_text = row['analysis']
+                embedding = self.embedding_model.encode(analysis_text)
+                # 存储函数信息和向量
+                function_info = {
+                    'package': row['package'],
+                    'class': row['clazz'],
+                    'method': row['func'],
+                    'signature': row['full_signature'],
+                    'embedding': embedding
+                }
+                self.vector_db_apis.append(function_info)
+        
+        print(f"API向量知识库构建完成，共包含 {len(self.vector_db_apis)} 个函数")
+
+    def load_labelled_apis(self):
+        """加载已标记的API函数"""
+        # 加载源函数
+        if os.path.exists(self.llm_labelled_source_apis_path):
+            with open(self.llm_labelled_source_apis_path, 'r', encoding='utf-8') as f:
+                self.labelled_apis['source'] = json.load(f)
+            print(f"加载源函数 {len(self.labelled_apis['source'])} 个")
+        
+        # 加载sink函数
+        if os.path.exists(self.llm_labelled_sink_apis_path):
+            with open(self.llm_labelled_sink_apis_path, 'r', encoding='utf-8') as f:
+                self.labelled_apis['sink'] = json.load(f)
+            print(f"加载sink函数 {len(self.labelled_apis['sink'])} 个")
+        
+        # 加载污点传播函数
+        if os.path.exists(self.llm_labelled_taint_prop_apis_path):
+            with open(self.llm_labelled_taint_prop_apis_path, 'r', encoding='utf-8') as f:
+                self.labelled_apis['taint-propagator'] = json.load(f)
+            print(f"加载污点传播函数 {len(self.labelled_apis['taint-propagator'])} 个")
+
+    def find_unlabelled_apis(self):
+        """找出所有未标记的API函数"""
+        # 创建已标记函数的唯一标识符集合
+        labelled_ids = set()
+        
+        for label_type, functions in self.labelled_apis.items():
+            for func in functions:
+                func_id = (func['package'], func['class'], func['method'], func['signature'])
+                labelled_ids.add(func_id)
+        
+        # 筛选未标记的函数
+        unlabelled = []
+        for func in self.vector_db_apis:
+            func_id = (func['package'], func['class'], func['method'], func['signature'])
+            if func_id not in labelled_ids:
+                unlabelled.append(func)
+        
+        print(f"找到 {len(unlabelled)} 个未标记的API函数")
+        return unlabelled
+
+    def _save_propagated_apis(self, propagated_labels):
+        """保存传播后的API标签到对应的JSON文件"""
+        # 保存source函数
+        if propagated_labels['source']:
+            self._save_propagated_labels(
+                propagated_labels['source'], 
+                self.llm_labelled_source_apis_path,
+                'source'
+            )
+        
+        # 保存sink函数
+        if propagated_labels['sink']:
+            self._save_propagated_labels(
+                propagated_labels['sink'], 
+                self.llm_labelled_sink_apis_path,
+                'sink'
+            )
+        
+        # 保存taint-propagator函数
+        if propagated_labels['taint-propagator']:
+            self._save_propagated_labels(
+                propagated_labels['taint-propagator'], 
+                self.llm_labelled_taint_prop_apis_path,
+                'taint-propagator'
+            )
+
+    def propagate_api_labels(self):
+        """执行API标签传播"""
+        # 确保数据已加载
+        if not self.vector_db_apis:
+            self.load_analysed_apis()
+        
+        if not any(self.labelled_apis.values()):
+            self.load_labelled_apis()
+        
+        # 找到未标记的函数
+        unlabelled = self.find_unlabelled_apis()
+        if not unlabelled:
+            print("没有未标记的API函数需要处理")
+            return
+        
+        propagated = {
+            'source': [],
+            'sink': [],
+            'taint-propagator': []
+        }
+        
+        print(f"开始API标签传播，共处理 {len(unlabelled)} 个函数")
+        
+        for i, func in enumerate(unlabelled, 1):
+            if i % 10 == 0:
+                print(f"已处理 {i}/{len(unlabelled)} 个API函数")
+            # 找到最相似的已标记函数
+            first_fitted_similar = self._find_fitted_similar(
+                func, self.labelled_apis, self.vector_db_apis, has_label_type=True)
+            if not first_fitted_similar:
+                continue
+            # 创建新的标签条目
+            new_entry = {
+                'package': func['package'],
+                'class': func['class'],
+                'method': func['method'],
+                'signature': func['signature'],
+                'sink_args': [],
+                'type': first_fitted_similar['label_type'],
+            }
+            # 添加到相应的标签组
+            propagated[first_fitted_similar['label_type']].append(new_entry)
+        # 统计结果
+        total = sum(len(v) for v in propagated.values())
+        print(f"API标签传播完成，共为 {total} 个函数自动标记标签")
+        
+        # 保存结果
+        self._save_propagated_apis(propagated)
+
+    # ------------------------------
+    # 函数参数标签传播相关方法
+    # ------------------------------
+    def load_analysed_func_params(self):
+        """加载分析过的函数参数数据并构建向量知识库"""
+        print(f"加载并处理函数参数数据: {self.analysed_func_params_path}")
+        
+        if not os.path.exists(self.analysed_func_params_path):
+            print(f"函数参数数据文件不存在: {self.analysed_func_params_path}")
+            return
+            
+        with open(self.analysed_func_params_path, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                # 对analysis文本进行向量化
+                analysis_text = row['analysis']
+                embedding = self.embedding_model.encode(analysis_text)
+                
+                # 提取函数参数
+                params = self._extract_parameters(row['full_signature'])
+                
+                # 存储函数信息和向量，不包含doc列
+                function_info = {
+                    'package': row['package'],
+                    'class': row['clazz'],
+                    'method': row['func'],
+                    'signature': row['full_signature'],
+                    'embedding': embedding,
+                    'parameters': params
+                }
+                self.vector_db_func_params.append(function_info)
+        print(f"函数参数向量知识库构建完成，共包含 {len(self.vector_db_func_params)} 个函数")
+
+    def load_labelled_func_params(self):
+        """加载已标记的函数参数"""
+        if os.path.exists(self.llm_labelled_source_func_params_path):
+            with open(self.llm_labelled_source_func_params_path, 'r', encoding='utf-8') as f:
+                self.labelled_func_params = json.load(f)
+            print(f"加载已标记的函数参数 {len(self.labelled_func_params)} 个")
+        else:
+            print(f"未找到已标记的函数参数文件: {self.llm_labelled_source_func_params_path}")
+            self.labelled_func_params = []
+
+    def find_unlabelled_func_params(self):
+        """找出所有未标记的函数参数"""
+        # 创建已标记函数的唯一标识符集合
+        labelled_ids = set()
+        
+        for func in self.labelled_func_params:
+            func_id = (func['package'], func['class'], func['method'], func['signature'])
+            labelled_ids.add(func_id)
+        
+        # 筛选未标记的函数
+        unlabelled = []
+        for func in self.vector_db_func_params:
+            func_id = (func['package'], func['class'], func['method'], func['signature'])
+            if func_id not in labelled_ids:
+                unlabelled.append(func)
+        
+        print(f"找到 {len(unlabelled)} 个未标记的函数参数")
+        return unlabelled
+
+    def _save_propagated_func_params(self, propagated_labels):
+        """保存传播后的函数参数标签到对应的JSON文件"""
+        self._save_propagated_labels(
+            propagated_labels, 
+            self.llm_labelled_source_func_params_path,
+            'source'
+        )
+
+    def _extract_parameters(self, signature):
+        """从函数签名中提取参数名"""
+        if '(' not in signature or ')' not in signature:
+            return []
+            
+        params_part = signature.split('(')[1].split(')')[0]
+        if not params_part:
+            return []
+            
+        # 分割参数并提取参数名（假设格式为"类型 参数名"）
+        params = []
+        for param in params_part.split(','):
+            param = param.strip()
+            if param:
+                # 取最后一个空格后的部分作为参数名
+                param_name = param.split()[-1]
+                params.append(param_name)
+                
+        return params
+
+    def propagate_func_param_labels(self):
+        """执行函数参数标签传播"""
+        # 确保数据已加载
+        if not self.vector_db_func_params:
+            self.load_analysed_func_params()
+        
+        if not self.labelled_func_params:
+            self.load_labelled_func_params()
+        
+        # 找到未标记的函数参数
+        unlabelled = self.find_unlabelled_func_params()
+        if not unlabelled:
+            print("没有未标记的函数参数需要处理")
+            return
+        
+        propagated = []
+        
+        print(f"开始函数参数标签传播，共处理 {len(unlabelled)} 个函数")
+        
+        for i, func in enumerate(unlabelled, 1):
+            if i % 10 == 0:
+                print(f"已处理 {i}/{len(unlabelled)} 个函数参数")
+                
+            # 找到最相似的已标记函数
+            first_fitted_similar = self._find_fitted_similar(func, self.labelled_func_params, self.vector_db_func_params, has_label_type=False) 
+            if not first_fitted_similar:
+                continue
+            # 创建新的标签条目，tainted_input为新标记函数的所有形参
+            new_entry = {
+                'package': func['package'],
+                'class': func['class'],
+                'method': func['method'],
+                'signature': func['signature'],
+                'tainted_input': func['parameters'],  # 使用解析出的所有参数
+            }
+            propagated.append(new_entry)
+        
+        print(f"函数参数标签传播完成，共为 {len(propagated)} 个函数自动标记标签")
+        
+        # 保存结果
+        self._save_propagated_func_params(propagated)
+
+    def _find_fitted_similar(self, target_func, labelled_items, vector_db, has_label_type=False):
+        """
+        找到第一个超过阈值的已标记项
+        
+        Args:
+            target_func: 目标未标记函数
+            labelled_items: 已标记的函数列表
+            vector_db: 向量数据库
+            has_label_type: 是否包含标签类型（API场景为True，函数参数场景为False）
+            
+        Returns:
+            第一个超过阈值的函数信息，包含相似度；若无则返回None
+        """
+        labelled_with_embeddings = []
+        
+        # 根据是否需要标签类型处理不同格式的输入
+        if has_label_type:
+            # API场景：labelled_items是包含label_type的字典
+            for label_type, functions in labelled_items.items():
+                for func in functions:
+                    match = self._find_matching_function(func, vector_db)
+                    if match:
+                        labelled_with_embeddings.append({
+                            'function': func,
+                            'label_type': label_type,
+                            'embedding': match['embedding']
+                        })
+        else:
+            # 函数参数场景：labelled_items是简单列表
+            for func in labelled_items:
+                match = self._find_matching_function(func, vector_db)
+                if match:
+                    labelled_with_embeddings.append({
+                        'function': func,
+                        'embedding': match['embedding']
+                    })
+        
+        if not labelled_with_embeddings:
+            return None
+        
+        # 计算第一个相似的项
+        target_embedding = target_func['embedding'].reshape(1, -1)
+
+        for item in labelled_with_embeddings:
+            emb = item['embedding'].reshape(1, -1)
+            similarity = cosine_similarity(target_embedding, emb)[0][0]
+            if similarity > self.similarity_threshold:
+                first_fitted_similar = {
+                    'function': item['function'],
+                }
+                # 如果有标签类型，添加到结果中
+                if has_label_type:
+                    first_fitted_similar['label_type'] = item['label_type']
+                break
+
+        return first_fitted_similar
+
+    def _find_matching_function(self, func, vector_db):
+        """辅助方法：在向量库中找到匹配的函数"""
+        return next((f for f in vector_db 
+                    if f['package'] == func['package'] 
+                    and f['class'] == func['class']
+                    and f['method'] == func['method']
+                    and f['signature'] == func['signature']), None)
+
+    def _save_propagated_labels(self, propagated, file_path, label_type):
+        """通用的保存传播标签的方法"""
+        if not propagated:
+            return
+            
+        # 加载现有数据
+        existing = []
+        if os.path.exists(file_path):
+            with open(file_path, 'r', encoding='utf-8') as f:
+                existing = json.load(f)
+        
+        # 合并并去重
+        combined = existing + propagated
+        unique_combined = self._remove_duplicates(combined)
+        
+        # 保存结果
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(unique_combined, f, indent=2, ensure_ascii=False)
+        
+        print(f"已将 {len(propagated)} 个{label_type}函数标记追加到 {file_path}")
+
+    def _remove_duplicates(self, functions):
+        """移除重复的函数条目"""
+        seen = set()
+        unique_functions = []
+        
+        for func in functions:
+            func_id = (func['package'], func['class'], func['method'], func['signature'])
+            if func_id not in seen:
+                seen.add(func_id)
+                unique_functions.append(func)
+        
+        return unique_functions
 
     def build_source_qll_with_enumeration(self):
         source_apis = self.filter_invalid_entries(json.load(open(self.llm_labelled_source_apis_path)))
@@ -1127,7 +1708,7 @@ class SAPipeline:
     def build_project_specific_query(self):
         if self.test_run: return
 
-        self.project_logger.info("==> Stage 5: Building project specific query...")
+        self.project_logger.info("==> Stage 8: Building project specific query...")
 
         self.project_logger.info("  ==> Building source query...")
         if self.use_exhaustive_qll:
@@ -1149,7 +1730,7 @@ class SAPipeline:
         self.build_and_save_extension_yml()
 
     def find_vulnerability(self):
-        self.project_logger.info("==> Stage 6: Finding vulnerabilities with CodeQL...")
+        self.project_logger.info("==> Stage 9: Finding vulnerabilities with CodeQL...")
 
         # Step 0: Check if result already exists
         if os.path.exists(self.query_output_result_sarif_path) and not self.overwrite and not self.overwrite_cwe_query_result:
@@ -1273,7 +1854,7 @@ class SAPipeline:
         return True
 
     def post_process_cwe_query_result(self):
-        self.project_logger.info("==> Stage 7: Post-processing CWE query results...")
+        self.project_logger.info("==> Stage 10: Post-processing CWE query results...")
         original_result_sarif = json.load(open(self.query_output_result_sarif_path))
         alarms = original_result_sarif["runs"][0]["results"]
 
@@ -1308,7 +1889,7 @@ class SAPipeline:
             json.dump(original_result_sarif, open(self.query_output_result_sarif_pp_path, "w"))
 
     def query_gpt_for_posthoc_filtering(self):
-        self.project_logger.info("==> Stage 8: Querying GPT for posthoc filtering...")
+        self.project_logger.info("==> Stage 11: Querying GPT for posthoc filtering...")
         if self.skip_posthoc_filter:
             self.project_logger.info("  ==> Skipping posthoc filter...")
             return
@@ -1364,7 +1945,7 @@ class SAPipeline:
         )
 
     def evaluate_result(self):
-        self.project_logger.info("==> Stage 9: Evaluating results...")
+        self.project_logger.info("==> Stage 12: Evaluating results...")
         if self.skip_evaluation:
             self.project_logger.info("  ==> skipping evaluation...")
             return
@@ -1432,7 +2013,10 @@ class SAPipeline:
         self.query_gpt_for_func_param_src()
         # self.llm_labelled_source_func_params_path = f"{self.common_output_path}/llm_labelled_source_func_params.json"
 
-        # 7. Build local query for this project
+        # 7. Label transmission with RAG 
+        self.label_transmit_with_rag()
+
+        # 8. Build local query for this project
         self.build_project_specific_query()
         # # CodeQL queries temporary path
         # self.source_qll_path = f"{self.cwe_output_path}/MySources.qll"
@@ -1440,28 +2024,28 @@ class SAPipeline:
         # self.sink_qll_path = f"{self.cwe_output_path}/MySinks.qll"
         # self.spec_yml_path = f"{self.cwe_output_path}/Spec.yml"
 
-        # 8. Send the local query for vulnerability detection
+        # 9. Send the local query for vulnerability detection
         self.find_vulnerability()
         # self.query_output_result_sarif_path = f"{self.query_output_path}/results.sarif"
         # self.query_output_result_csv_path = f"{self.query_output_path}/results.csv"
 
-        # 9. Do a post-processing step for rule-based filtering of paths
+        # 10. Do a post-processing step for rule-based filtering of paths
         self.post_process_cwe_query_result()
         # 对CodeQL检测出的漏洞结果进行“后处理”，
         # 过滤掉无效、无意义或误报的路径和告警，
         # 以提升最终输出结果的准确性和可用性
 
-        # 10. Do posthoc filtering
+        # 11. Do posthoc filtering
         self.query_gpt_for_posthoc_filtering()
         # self.posthoc_filtering_output_result_sarif_path = f"{self.posthoc_filtering_output_path}/results.sarif"
         # self.posthoc_filtering_output_result_json_path = f"{self.posthoc_filtering_output_path}/results.json"
         # self.posthoc_filtering_output_stats_json_path = f"{self.posthoc_filtering_output_path}/stats.json"
 
-        # 11. Evaluate performance
+        # 12. Evaluate performance
         self.evaluate_result()
         # self.final_output_json_path = f"{self.final_output_path}/results.json"
 
-        # 12. Debuggging
+        # 13. Debuggging
         self.debug_result()
 
 
@@ -1499,6 +2083,11 @@ if __name__ == '__main__':
     parser.add_argument("--debug-source", action="store_true")
     parser.add_argument("--debug-sink", action="store_true")
     parser.add_argument("--test-run", action="store_true")
+    parser.add_argument("--overwrite-analyze-api", action="store_true")
+    parser.add_argument("--overwrite-analyze-func", action="store_true")
+    parser.add_argument("--analysis", action="store_true")
+    parser.add_argument("--skip-api-transmit", action="store_true")
+    parser.add_argument("--skip-func-transmit", action="store_true")
     args = parser.parse_args()
 
     # Set basic properties
@@ -1537,6 +2126,11 @@ if __name__ == '__main__':
         debug_source=args.debug_source,
         debug_sink=args.debug_sink,
         test_run=args.test_run,
+        overwrite_analyze_api=args.overwrite_analyze_api,
+        overwrite_analyze_func=args.overwrite_analyze_func,
+        analysis=args.analysis,
+        skip_api_transmit=args.skip_api_transmit,
+        skip_func_transmit=args.skip_func_transmit,
     )
 
     pipeline.run()

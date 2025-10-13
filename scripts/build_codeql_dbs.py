@@ -69,6 +69,12 @@ def setup_environment(row, java_env_path):
         env['PATH'] = f"{maven_path}:{env.get('PATH', '')}"
         print(f"Maven path set to: {maven_path}")
     
+    #set Gradle path
+    if row['gradle_version']!='n/a':
+        gradle_path=os.path.abspath(os.path.join(java_env_path, f"gradle-{row['gradle_version']}/bin"))
+        env['PATH'] = f"{gradle_path}:{env.get('PATH', '')}"
+        print(f"Gradle path set to: {gradle_path}")
+
     # Find and set Java home
     java_version = row['jdk_version']
     java_home = find_java_home(java_version, java_env_path)
@@ -82,7 +88,20 @@ def setup_environment(row, java_env_path):
     
     return env
 
-def create_codeql_database(project_slug, env, db_base_path, sources_base_path):
+def has_gradle_test_task(source_path, env):
+    try:
+        output = subprocess.check_output(
+            ["gradle", "tasks", "--all"],
+            cwd=source_path,
+            env=env,
+            stderr=subprocess.STDOUT
+        ).decode()
+        return "test -" in output or "\ntest\n" in output
+    except Exception as e:
+        print(f"Warning: Could not check gradle tasks: {e}")
+        return False
+
+def create_codeql_database(project_slug, env, db_base_path, sources_base_path,row):
     print("\nEnvironment variables for CodeQL database creation:")
     print(f"PATH: {env.get('PATH', 'Not set')}")
     print(f"JAVA_HOME: {env.get('JAVA_HOME', 'Not set')}")
@@ -101,6 +120,20 @@ def create_codeql_database(project_slug, env, db_base_path, sources_base_path):
     
     Path(database_path).parent.mkdir(parents=True, exist_ok=True)
     
+    # command = [
+    #     "codeql", "database", "create",
+    #     database_path,
+    #     "--source-root", source_path,
+    #     "--language", "java",
+    #     "--overwrite"
+    # ]
+        # 根据项目配置选择构建命令
+    build_command = None
+    if row['mvn_version'] != 'n/a':
+        build_command = "mvn clean package -DskipTests"
+    elif row['gradle_version'] != 'n/a':
+        build_command = "gradle build"
+    
     command = [
         "codeql", "database", "create",
         database_path,
@@ -108,11 +141,14 @@ def create_codeql_database(project_slug, env, db_base_path, sources_base_path):
         "--language", "java",
         "--overwrite"
     ]
+    if build_command:
+        command += ["--command", build_command]
     
     try:
         print(f"Creating database at: {database_path}")
         print(f"Using source path: {source_path}")
         print(f"Using JAVA_HOME: {env.get('JAVA_HOME', 'Not set')}")
+        print(f"Running command: {' '.join(command)}")
         subprocess.run(command, env=env, check=True)
         print(f"Successfully created CodeQL database for {project_slug}")
     except subprocess.CalledProcessError as e:
@@ -139,13 +175,13 @@ def main():
         project = next((p for p in projects if p['project_slug'] == args.project), None)
         if project:
             env = setup_environment(project, java_env_path)
-            create_codeql_database(project['project_slug'], env, args.db_path, args.sources_path)
+            create_codeql_database(project['project_slug'], env, args.db_path, args.sources_path,project)
         else:
             print(f"Project {args.project} not found in CSV file")
     else:
         for project in projects:
             env = setup_environment(project, java_env_path)
-            create_codeql_database(project['project_slug'], env, args.db_path, args.sources_path)
+            create_codeql_database(project['project_slug'], env, args.db_path, args.sources_path,project)
 
 if __name__ == "__main__":
     main()
