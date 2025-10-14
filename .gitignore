@@ -7,5 +7,5 @@ commit_data
 old
 outputs*
 output/
-
+codeql/
 **/__pycache__
