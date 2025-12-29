@@ -9,3 +9,6 @@ outputs*
 output/
 codeql/
 **/__pycache__
+log
+log_dir
+!log_dir/find_diff_projects.py
