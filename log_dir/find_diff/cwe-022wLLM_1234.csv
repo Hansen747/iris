@@ -1,0 +1,10 @@
+project_slug,analysis_results,non_analysis_results
+asf__james-project_CVE-2022-22931_3.6.0,not found,not found
+aws__aws-sdk-java_CVE-2022-31159_1.12.260,not found,not found
+payara__Payara_CVE-2022-37422_5.2022.2,not found,not found
+apache__uima-uimaj_CVE-2022-32287_3.3.0,not found,not found
+keycloak__keycloak_CVE-2022-3782_20.0.1,not found,not found
+hapifhir__org.hl7.fhir.core_CVE-2023-24057_5.6.91,not found,not found
+hapifhir__org.hl7.fhir.core_CVE-2023-28465_5.6.105,not found,not found
+yamcs__yamcs_CVE-2023-45278_5.8.6,not found,not found
+yamcs__yamcs_CVE-2023-45277_5.8.6,not found,not found

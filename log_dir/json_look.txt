@@ -1,0 +1,36 @@
+{
+    "statistics": 
+    {
+        "num_external_api_calls": 1968, 
+        "num_api_candidates": 318, 
+        "num_labelled_sources": 40, 
+        "num_labelled_taint_propagators": 149, 
+        "num_labelled_sinks": 16, 
+        "num_public_func_candidates": 7, 
+        "num_labelled_func_param_sources": 3, 
+        "num_gpt_calls_for_posthoc_filtering": 0, 
+        "num_cached_during_posthoc_filtering": 0
+    }, 
+    "vanilla_result": 
+    {
+        "num_results": 6, 
+        "num_paths": 15, 
+        "recall_file": false, 
+        "num_tp_paths_file": 0, 
+        "num_tp_results_file": 0, 
+        "recall_method": false, 
+        "num_tp_paths_method": 0, 
+        "num_tp_results_method": 0
+    }, 
+    "posthoc_filter_result": 
+    {
+        "num_results": 6, 
+        "num_paths": 4, 
+        "recall_file": false, 
+        "num_tp_paths_file": 0, 
+        "num_tp_results_file": 0, 
+        "recall_method": false, 
+        "num_tp_paths_method": 0, 
+        "num_tp_results_method": 0
+    }
+}

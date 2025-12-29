@@ -1,0 +1,3 @@
+[INFO] [2025-12-24 15:56:16] ==> Cached final result found; skipping
+[INFO] [2025-12-24 15:56:16] Processing apache__camel_CVE-2018-8041_2.20.3 (Query: cwe-022wLLM, Trial: 1234)...
+[ERROR] [2025-12-24 15:56:16] ==> Cannot find CodeQL database for apache__camel_CVE-2018-8041_2.20.3; aborting
